@@ -17,12 +17,35 @@ function logerror(e, loglevel=Logging.Info)
     close(io)
 end
 
-const _manifest = Dict{String,String}(
-    "resourcegroup" => "",
-    "ssh_user" => "",
-    "ssh_private_key_file" => "",
-    "ssh_public_key_file" => "",
-    "subscriptionid" => "")
+mutable struct AzManagersManifest
+    resourcegroup::String
+    ssh_user::String
+    ssh_private_key_file::String
+    ssh_public_key_file::String
+    subscriptionid::String
+end
+
+AzManagersManifest() = AzManagersManifest("", "", "", "", "")
+
+const MANIFEST_FIELDS = ("resourcegroup", "ssh_user", "ssh_private_key_file",
+                        "ssh_public_key_file", "subscriptionid")
+
+function Base.getindex(manifest::AzManagersManifest, key::AbstractString)
+    key in MANIFEST_FIELDS ||
+        throw(KeyError(key))
+    getfield(manifest, Symbol(key))
+end
+
+function Base.setindex!(manifest::AzManagersManifest, value, key::AbstractString)
+    key in MANIFEST_FIELDS ||
+        throw(KeyError(key))
+    setfield!(manifest, Symbol(key), String(value))
+end
+
+Base.keys(::AzManagersManifest) = MANIFEST_FIELDS
+Base.haskey(manifest::AzManagersManifest, key::AbstractString) = key in MANIFEST_FIELDS
+
+const _manifest = AzManagersManifest()
 
 manifestpath() = joinpath(homedir(), ".azmanagers")
 manifestfile() = joinpath(manifestpath(), "manifest.json")
@@ -70,6 +93,7 @@ function load_manifest()
     else
         @error "Manifest file ($(AzManagers.manifestfile())) does not exist.  Use AzManagers.write_manifest to generate a manifest file."
     end
+    _manifest
 end
 
 include("templates.jl")

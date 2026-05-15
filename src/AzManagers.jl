@@ -30,6 +30,7 @@ manifestfile() = joinpath(manifestpath(), "manifest.json")
 include("placement.jl")
 include("azure_api.jl")
 include("cluster_manager.jl")
+include("cloud_init.jl")
 
 """
     AzManagers.write_manifest(;resourcegroup="", subscriptionid="", ssh_user="", ssh_public_key_file="~/.ssh/azmanagers_rsa.pub", ssh_private_key_file="~/.ssh/azmanagers_rsa")
@@ -1755,24 +1756,6 @@ function buildstartupscript(manager::AzManager, exename::String, user::String, d
     end
 
     cmd, remote_julia_environment_name
-end
-
-function shell_quote(value)
-    "'" * replace(string(value), "'" => "'\"'\"'") * "'"
-end
-
-function valid_environment_name(name)
-    occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", string(name))
-end
-
-function build_envstring(env::Dict)
-    envstring = ""
-    for (key,value) in env
-        valid_environment_name(key) ||
-            throw(ArgumentError("invalid environment variable name: $key"))
-        envstring *= "export $key=$(shell_quote(value))\n"
-    end
-    envstring
 end
 
 function buildstartupscript_cluster(manager::AzManager, spot::Bool, ppi::Int, mpi_ranks_per_worker::Int, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig, julia_num_threads::String, omp_num_threads::Int, exename::String, exeflags::String, env::Dict, user::String,

@@ -293,3 +293,10 @@ end
         delete!(AzManagers.DETACHED_JOBS, "unit")
     end
 end
+
+@testset "unit: pin_julia_threads fallback without ThreadPinning" begin
+    @test AzManagers._pin_julia_threads_impl(Int[]) == false
+    @test AzManagers._pin_julia_threads_impl([0, 1]) == false
+    @test AzManagers.pin_julia_threads(Int[]) == false
+    @test AzManagers.pin_julia_threads([0, 1, 2]) == false
+end

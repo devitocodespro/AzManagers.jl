@@ -164,6 +164,22 @@ function worker_placement_metadata(
         "pinning_backend" => "numactl")
 end
 
+const PLACEMENT_USERDATA_KEYS = Set([
+    "localid",
+    "worker_per_vm",
+    "physical_cores",
+    "julia_threads",
+    "julia_interactive_threads",
+    "omp_threads",
+    "cpu_set",
+    "numa_node",
+    "socket",
+    "pinning_backend"])
+
+function placement_userdata(userdata::Dict)
+    Dict(key => userdata[key] for key in PLACEMENT_USERDATA_KEYS if haskey(userdata, key))
+end
+
 function sorted_unique_cpus(cpu_sets)
     sort!(collect(union((Set(cpu_set) for cpu_set in cpu_sets)...)))
 end
@@ -271,12 +287,21 @@ function numactl_arguments(placement::WorkerPlacement)
     args
 end
 
+function numactl_prefix(placement::WorkerPlacement)
+    isempty(placement.cpu_set) && return ""
+    "numactl " * join(numactl_arguments(placement), " ") * " "
+end
+
 function placement_environment(placement::WorkerPlacement)
     Dict(
         "JULIA_NUM_THREADS" => julia_threads_string(placement),
         "OMP_NUM_THREADS" => string(placement.omp_threads),
         "OMP_PROC_BIND" => "close",
         "OMP_PLACES" => "cores")
+end
+
+function placement_export_string(placement::WorkerPlacement)
+    build_envstring(placement_environment(placement))
 end
 
 function pin_julia_threads(cpu_set::Vector{Int})

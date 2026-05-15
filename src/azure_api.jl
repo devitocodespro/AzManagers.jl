@@ -336,43 +336,62 @@ function nphysical_cores(template::AbstractString; session=AzSession())
     nphysical_cores(template; session)
 end
 
-function getnextlinks!(manager::AzManager, _r, value, nextlink, nretry, verbose)
+function collect_nextlink_pages!(request_page, value, nextlink)
+    last_response = nothing
     while nextlink != ""
-        _r = @retry nretry azrequest(
+        last_response = request_page(nextlink)
+        page = JSON.parse(String(last_response.body))
+        value = [value; get(page, "value", [])]
+        nextlink = get(page, "nextLink", "")
+    end
+    value, last_response
+end
+
+function getnextlinks!(manager::AzManager, _r, value, nextlink, nretry, verbose)
+    request_page = function (url)
+        @retry nretry azrequest(
             "GET",
             verbose,
-            nextlink,
+            url,
             ["Authorization"=>"Bearer $(token(manager.session))"])
-        r = JSON.parse(String(_r.body))
-        value = [value;get(r,"value",[])]
-        nextlink = get(r, "nextLink", "")
     end
+    value, next_response = collect_nextlink_pages!(request_page, value, nextlink)
+    _r = next_response === nothing ? _r : next_response
     value, _r
 end
 
-function resourcegraphrequest(manager, body)
+function collect_resourcegraph_pages(request_page, body)
     skiptoken = ""
     data = []
-    local _r
+    last_response = nothing
     while true
         if skiptoken != ""
             body["\$skipToken"] = skiptoken
         end
-        _r = @retry manager.nretry azrequest(
-            "POST",
-            manager.verbose,
-            "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01",
-            ["Authorization"=>"Bearer $(token(manager.session))", "Content-Type"=>"application/json"],
-            JSON.json(body)
-        )
-        r = JSON.parse(String(_r.body))
-        data = [data;get(r, "data", [])]
+        last_response = request_page(body)
+        r = JSON.parse(String(last_response.body))
+        data = [data; get(r, "data", [])]
         skiptoken = get(r, "\$skipToken", "")
 
         if skiptoken == ""
             break
         end
     end
+
+    data, last_response
+end
+
+function resourcegraphrequest(manager, body)
+    request_page = function (request_body)
+        @retry manager.nretry azrequest(
+            "POST",
+            manager.verbose,
+            "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01",
+            ["Authorization"=>"Bearer $(token(manager.session))", "Content-Type"=>"application/json"],
+            JSON.json(request_body)
+        )
+    end
+    data, _r = collect_resourcegraph_pages(request_page, body)
 
     if manager.show_quota
         @info "Quota after getting instances for scaleset pruning" remaining_resource(_r)

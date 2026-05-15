@@ -1,4 +1,4 @@
-using AzManagers, HTTP, JSON, Test
+using AzManagers, HTTP, JSON, Pkg, Test
 
 function synthetic_topology()
     sockets = [
@@ -52,6 +52,51 @@ end
     @test AzManagers.status(error) == 429
     @test AzManagers.remaining_resource(response) == "quota"
     @test !AzManagers.isretryable(ArgumentError("no retry"))
+end
+
+@testset "unit: mocked Azure pagination" begin
+    nextlink_responses = Dict(
+        "page-2" => HTTP.Response(
+            200,
+            JSON.json(Dict("value" => [2], "nextLink" => "page-3"))),
+        "page-3" => HTTP.Response(
+            200,
+            JSON.json(Dict("value" => [3]))))
+    nextlink_requests = String[]
+    nextlink_request = function (url)
+        push!(nextlink_requests, url)
+        nextlink_responses[url]
+    end
+
+    values, last_response = AzManagers.collect_nextlink_pages!(
+        nextlink_request,
+        [1],
+        "page-2")
+
+    @test values == [1, 2, 3]
+    @test nextlink_requests == ["page-2", "page-3"]
+    @test JSON.parse(String(last_response.body))["value"] == [3]
+
+    resourcegraph_responses = [
+        HTTP.Response(
+            200,
+            JSON.json(Dict("data" => ["vm-1"], "\$skipToken" => "next"))),
+        HTTP.Response(
+            200,
+            JSON.json(Dict("data" => ["vm-2"])))]
+    resourcegraph_bodies = Dict[]
+    resourcegraph_request = function (body)
+        push!(resourcegraph_bodies, copy(body))
+        popfirst!(resourcegraph_responses)
+    end
+
+    data, _ = AzManagers.collect_resourcegraph_pages(
+        resourcegraph_request,
+        Dict("query" => "Resources"))
+
+    @test data == ["vm-1", "vm-2"]
+    @test !haskey(resourcegraph_bodies[1], "\$skipToken")
+    @test resourcegraph_bodies[2]["\$skipToken"] == "next"
 end
 
 @testset "unit: automatic worker placement" begin
@@ -152,6 +197,43 @@ end
     placement_exports = AzManagers.placement_export_string(placement)
     @test contains(placement_exports, "export JULIA_NUM_THREADS='4,1'")
     @test contains(placement_exports, "export OMP_PROC_BIND='close'")
+end
+
+@testset "unit: environment compression round trip" begin
+    mktempdir() do environment_dir
+        write(joinpath(environment_dir, "Project.toml"), "[deps]\n")
+        write(joinpath(environment_dir, "Manifest.toml"), "# manifest\n")
+        write(joinpath(environment_dir, "LocalPreferences.toml"), "flag = true\n")
+
+        project, manifest, preferences =
+            AzManagers.compress_environment(environment_dir)
+
+        mktempdir() do depot_dir
+            old_depot_path = copy(DEPOT_PATH)
+            try
+                empty!(DEPOT_PATH)
+                push!(DEPOT_PATH, depot_dir)
+
+                AzManagers.decompress_environment(
+                    project,
+                    manifest,
+                    preferences,
+                    "azmanagers-unit")
+
+                remote_dir = joinpath(Pkg.envdir(), "azmanagers-unit")
+                @test read(joinpath(remote_dir, "Project.toml"), String) ==
+                    "[deps]\n"
+                @test read(joinpath(remote_dir, "Manifest.toml"), String) ==
+                    "# manifest\n"
+                @test read(
+                    joinpath(remote_dir, "LocalPreferences.toml"),
+                    String) == "flag = true\n"
+            finally
+                empty!(DEPOT_PATH)
+                append!(DEPOT_PATH, old_depot_path)
+            end
+        end
+    end
 end
 
 @testset "unit: VM template resource IDs" begin

@@ -402,6 +402,30 @@ end
     end
 end
 
+@testset "unit: manifest state holder" begin
+    manifest = AzManagers.AzManagersManifest()
+    @test manifest["resourcegroup"] == ""
+    manifest["resourcegroup"] = "rg-1"
+    manifest["subscriptionid"] = "sub-1"
+    @test manifest.resourcegroup == "rg-1"
+    @test manifest["subscriptionid"] == "sub-1"
+    @test "ssh_user" in keys(manifest)
+    @test haskey(manifest, "subscriptionid")
+    @test_throws KeyError manifest["does-not-exist"]
+    @test_throws KeyError manifest["bogus"] = "x"
+end
+
+@testset "unit: variable bundle state" begin
+    @test AzManagers.VARIABLE_BUNDLE === AzManagers.VARIABLE_BUNDLE_STATE.bundle
+    empty!(AzManagers.VARIABLE_BUNDLE_STATE.bundle)
+    AzManagers.variablebundle!(; alpha=1, beta="two")
+    @test AzManagers.variablebundle(:alpha) == 1
+    @test AzManagers.variablebundle(:beta) == "two"
+    AzManagers.variablebundle!(Dict("gamma" => 3))
+    @test AzManagers.variablebundle(:gamma) == 3
+    empty!(AzManagers.VARIABLE_BUNDLE_STATE.bundle)
+end
+
 @testset "unit: pin_julia_threads fallback without ThreadPinning" begin
     @test AzManagers._pin_julia_threads_impl(Int[]) == false
     @test AzManagers._pin_julia_threads_impl([0, 1]) == false

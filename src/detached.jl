@@ -746,12 +746,18 @@ function detached_service_wait(vm, custom_environment)
     write(stdout, "\n")
 end
 
-const VARIABLE_BUNDLE = Dict{Symbol,Any}()
+struct VariableBundleState
+    bundle::Dict{Symbol,Any}
+end
+
+const VARIABLE_BUNDLE_STATE = VariableBundleState(Dict{Symbol,Any}())
+const VARIABLE_BUNDLE = VARIABLE_BUNDLE_STATE.bundle
+
 function variablebundle!(bundle::Dict)
     for (key,value) in bundle
-        AzManagers.VARIABLE_BUNDLE[Symbol(key)] = value
+        VARIABLE_BUNDLE_STATE.bundle[Symbol(key)] = value
     end
-    AzManagers.VARIABLE_BUNDLE
+    VARIABLE_BUNDLE_STATE.bundle
 end
 
 """
@@ -773,11 +779,11 @@ read(myjob)
 """
 function variablebundle!(;kwargs...)
     for kwarg in kwargs
-        AzManagers.VARIABLE_BUNDLE[kwarg[1]] = kwarg[2]
+        VARIABLE_BUNDLE_STATE.bundle[kwarg[1]] = kwarg[2]
     end
-    AzManagers.VARIABLE_BUNDLE
+    VARIABLE_BUNDLE_STATE.bundle
 end
-variablebundle() = AzManagers.VARIABLE_BUNDLE
+variablebundle() = VARIABLE_BUNDLE_STATE.bundle
 
 """
     variablebundle(:key)
@@ -785,7 +791,7 @@ variablebundle() = AzManagers.VARIABLE_BUNDLE
 Retrieve a variable from a variable bundle.  See `variablebundle!`
 for more information.
 """
-variablebundle(key) = AzManagers.VARIABLE_BUNDLE[Symbol(key)]
+variablebundle(key) = VARIABLE_BUNDLE_STATE.bundle[Symbol(key)]
 
 function detached_run(code, ip::String="", port=detached_port();
         persist=true,

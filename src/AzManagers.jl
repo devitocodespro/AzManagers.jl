@@ -804,7 +804,7 @@ used on the Julia workers.  This feature makes use of package extensions, meanin
 that `using MPI` is somewhere in your calling script.
 [5] This may result in a re-boot of the VMs
 """
-function Distributed.addprocs(_::AzManager, template::Dict, n::Int;
+function Distributed.addprocs(::AzManager, template::Dict, n::Int;
         subscriptionid = "",
         resourcegroup = "",
         sigimagename = "",
@@ -2105,6 +2105,12 @@ function buildstartupscript_detached(manager::AzManager, exename::String, julia_
     cmd
 end
 
+function azure_compute_usages_url(subscriptionid, location)
+    base_url = "https://management.azure.com/subscriptions/$subscriptionid"
+    compute_path = "providers/Microsoft.Compute/locations/$location/usages"
+    "$base_url/$compute_path?api-version=2019-07-01"
+end
+
 function quotacheck(manager, subscriptionid, template, δn, nretry, verbose)
     location = template["location"]
 
@@ -2158,7 +2164,7 @@ function quotacheck(manager, subscriptionid, template, δn, nretry, verbose)
     _r = @retry nretry azrequest(
         "GET",
         verbose,
-        "https://management.azure.com/subscriptions/$subscriptionid/providers/Microsoft.Compute/locations/$location)/usages?api-version=2019-07-01",
+        azure_compute_usages_url(subscriptionid, location),
         ["Authorization"=>"Bearer $(token(manager.session))"])
     r = JSON.parse(String(_r.body))
 
@@ -2735,7 +2741,7 @@ function detachedrun(request::HTTP.Request)
         end
         if !r["persist"]
             vm = AzManagers.DETACHED_VM[]
-            rmproc(vm; session=sessionbundle(:management))
+            rmproc(vm)
         end
     end
     HTTP.Response(200, ["Content-Type"=>"application/json"], JSON.json(Dict("id"=>id, "pid"=>pid)); request)
@@ -2855,6 +2861,7 @@ function detachedwait(request::HTTP.Request)
         process = DETACHED_JOBS[id]["process"]
         wait(process)
     catch e
+        io = IOBuffer()
         @error "caught error waiting for process for job $id to finish"
         logerror(e, Logging.Debug)
 

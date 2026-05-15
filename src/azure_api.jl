@@ -123,3 +123,260 @@ function remaining_resource(response)
     remaining_resource_header
 end
 
+#=
+Use libCURL because HTTP forces the request to run, partially, on a thread in the default thread-pool
+where-as, we would like to run requests to the scaleset metadata server on the interactive thrad-pool.
+=#
+mutable struct CurlDataStruct
+    body::Vector{UInt8}
+    currentsize::Csize_t
+end
+
+function curl_get_write_callback(curlbuf::Ptr{Cchar}, size::Csize_t, nmemb::Csize_t, datavoid::Ptr{Cvoid})
+    datastruct = unsafe_pointer_to_objref(datavoid)::CurlDataStruct
+
+    n = size*nmemb
+    newsize = datastruct.currentsize + n
+    resize!(datastruct.body, newsize)
+
+    _data = pointer(datastruct.body, datastruct.currentsize+1)
+    @ccall memcpy(_data::Ptr{Cvoid}, curlbuf::Ptr{Cvoid}, n::Csize_t)::Ptr{Cvoid}
+    datastruct.currentsize = newsize
+    return n
+end
+
+function curl_get_metadata(url)
+    datastruct = CurlDataStruct(UInt8[], 0)
+
+    headers = C_NULL
+    headers = curl_slist_append(headers, "Metadata: true")
+
+    curl = curl_easy_init()
+    curl_easy_setopt(curl, CURLOPT_URL, url)
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers)
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, @cfunction(curl_get_write_callback, Csize_t, (Ptr{Cchar}, Csize_t, Csize_t, Ptr{Cvoid})))
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, pointer_from_objref(datastruct))
+
+    curl_easy_perform(curl)
+
+    http_code = Array{Clong}(undef, 1)
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code)
+    if http_code[1] > 200
+        error("Azure metaadata service return $(http_code[1]) response.")
+    end
+
+    curl_easy_cleanup(curl)
+
+    datastruct
+end
+
+function get_instanceid()
+    local r
+    try
+        # _r = HTTP.request("GET", "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01", ["Metadata"=>"true"])
+        _r = curl_get_metadata("http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01")
+        r = JSON.parse(String(_r.body))
+    catch
+        r = Dict()
+    end
+    get(r, "name", "")
+end
+
+"""
+    ispreempted,notbefore = preempted([id=myid()|id="instanceid"])
+
+Check to see if the machine `id::Int` has received an Azure spot preempt message.  Returns
+(true, notbefore) if a preempt message is received and (false,"") otherwise.  `notbefore`
+is the date/time before which the machine is guaranteed to still exist.
+"""
+function preempted(instanceid::AbstractString, clusterid::Int)
+    isempty(instanceid) && (instanceid = get_instanceid())
+    clusterid == 0 && (clusterid = myid())
+    local _r
+    try
+        tic = time()
+        # _r = HTTP.request("GET", "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01", ["Metadata"=>"true"])
+        _r = curl_get_metadata("http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01")
+        if time() - tic > 55 # 55 seconds, simply because it is less that 60, and 60 seconds is the eviction notice.
+            @debug "$(now()), took longer than 55 seconds to query the meta-data server for scheduled events (elapsed time=$(time() - tic))."
+        end
+    catch
+        @warn "unable to get scheduledevents."
+        return false, ""
+    end
+    r = JSON.parse(String(_r.body))
+    for event in get(r, "Events", [])
+        if get(event, "EventType", "") == "Preempt" && instanceid ∈ get(event, "Resources", [])
+            @warn "Machine with id $clusterid ($instanceid) is being pre-empted" now(Dates.UTC) event["NotBefore"] event["EventType"] event["EventSource"]
+            return true, event["NotBefore"]
+        end
+    end
+    return false, ""
+end
+
+function azure_compute_usages_url(subscriptionid, location)
+    base_url = "https://management.azure.com/subscriptions/$subscriptionid"
+    compute_path = "providers/Microsoft.Compute/locations/$location/usages"
+    "$base_url/$compute_path?api-version=2019-07-01"
+end
+
+function quotacheck(manager, subscriptionid, template, δn, nretry, verbose)
+    location = template["location"]
+
+    # get a mapping from vm-size to vm-family
+    f = HTTP.escapeuri("location eq '$location'")
+
+    # resources in southcentralus
+    target = "https://management.azure.com/subscriptions/$subscriptionid/providers/Microsoft.Compute/skus?api-version=2021-07-01&\$filter=$f"
+    _r = @retry nretry azrequest(
+        "GET",
+        verbose,
+        target,
+        ["Authorization"=>"Bearer $(token(manager.session))"])
+
+    if manager.show_quota
+        @info "Quota after getting skus" remaining_resource(_r)
+    end
+
+    resources = JSON.parse(String(_r.body))["value"]
+
+    # filter to get only virtualMachines, TODO - can this filter be done in the above REST call?
+    vms = filter(resource->resource["resourceType"]=="virtualMachines", resources)
+
+    # find the vm in the resources list
+    local k
+    if haskey(template, "sku")
+        k = findfirst(vm->vm["name"]==template["sku"]["name"], vms) # for scale-set templates
+    else
+        k = findfirst(vm->vm["name"]==template["properties"]["hardwareProfile"]["vmSize"], vms) # for vm templates
+    end
+
+    if k == nothing
+        if haskey(template, "sku")
+            error("VM size $(template["sku"]["name"]) not found") # for scale-set templates
+        else
+            error("VM size $(template["properties"]["hardwareProfile"]["vmSize"]) not found") # for vm templates
+        end
+    end
+
+    family = vms[k]["family"]
+    capabilities = vms[k]["capabilities"]
+    k = findfirst(capability->capability["name"]=="vCPUs", capabilities)
+
+    if k == nothing
+        error("unable to find vCPUs capability in resource")
+    end
+
+    ncores_per_machine = parse(Int, capabilities[k]["value"])
+
+    # get usage in our location
+    _r = @retry nretry azrequest(
+        "GET",
+        verbose,
+        azure_compute_usages_url(subscriptionid, location),
+        ["Authorization"=>"Bearer $(token(manager.session))"])
+    r = JSON.parse(String(_r.body))
+
+    if manager.show_quota
+        @info "Quota after getting quota usage" remaining_resource(_r)
+    end
+
+    usages = r["value"]
+
+    k = findfirst(usage->usage["name"]["value"]==family, usages)
+
+    if k == nothing
+        error("unable to find SKU family in usages while chcking quota")
+    end
+
+    ncores_limit = r["value"][k]["limit"]
+    ncores_current = r["value"][k]["currentValue"]
+    ncores_available = ncores_limit - ncores_current
+
+    k = findfirst(usage->usage["name"]["value"]=="lowPriorityCores", usages)
+
+    if k == nothing
+        error("unable to find low-priority CPU limit while checking quota")
+    end
+    ncores_spot_limit = r["value"][k]["limit"]
+    ncores_spot_current = r["value"][k]["currentValue"]
+    ncores_spot_available = ncores_spot_limit - ncores_spot_current
+
+    ncores_available - (ncores_per_machine * δn), ncores_spot_available - (ncores_per_machine * δn)
+end
+
+function nphysical_cores(template::Dict; session=AzSession())
+    ssid = template["subscriptionid"]
+    region = template["value"]["location"]
+    sku_name = template["value"]["properties"]["hardwareProfile"]["vmSize"]
+
+    _r = HTTP.request("GET",
+        "https://management.azure.com/subscriptions/$ssid/providers/Microsoft.Compute/skus?api-version=2022-11-01",
+        ["Authorization" => "Bearer $(token(session))"])
+    r = JSON.parse(String(_r.body))
+
+
+    filtered_skus = filter(sku -> sku["name"] == sku_name && haskey(sku, "capabilities") && any(location -> location == region, sku["locations"]), r["value"])
+
+    vCPU_details = [(cap["value"], any(cap -> cap["name"] == "HyperThreadingEnabled" && cap["value"] == "true", sku["capabilities"])) for sku in filtered_skus for cap in sku["capabilities"] if cap["name"] == "vCPUs"]
+    hyperthreading = vCPU_details[1][2]
+    vCPU = vCPU_details[1][1]
+
+    # Number of physical cores
+    pCPU = hyperthreading ? div(parse(Int,vCPU),2) : parse(Int,vCPU)
+end
+
+function nphysical_cores(template::AbstractString; session=AzSession())
+    isfile(templates_filename_vm()) || error("scale-set template file does not exist.  See `AzManagers.save_template_scaleset`")
+
+    templates_scaleset = JSON.parse(read(templates_filename_vm(), String); dicttype=Dict)
+    haskey(templates_scaleset, template) || error("scale-set template file does not contain a template with name: $template. See `AzManagers.save_template_scaleset`")
+    template = templates_scaleset[template]
+
+    nphysical_cores(template; session)
+end
+
+function getnextlinks!(manager::AzManager, _r, value, nextlink, nretry, verbose)
+    while nextlink != ""
+        _r = @retry nretry azrequest(
+            "GET",
+            verbose,
+            nextlink,
+            ["Authorization"=>"Bearer $(token(manager.session))"])
+        r = JSON.parse(String(_r.body))
+        value = [value;get(r,"value",[])]
+        nextlink = get(r, "nextLink", "")
+    end
+    value, _r
+end
+
+function resourcegraphrequest(manager, body)
+    skiptoken = ""
+    data = []
+    local _r
+    while true
+        if skiptoken != ""
+            body["\$skipToken"] = skiptoken
+        end
+        _r = @retry manager.nretry azrequest(
+            "POST",
+            manager.verbose,
+            "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01",
+            ["Authorization"=>"Bearer $(token(manager.session))", "Content-Type"=>"application/json"],
+            JSON.json(body)
+        )
+        r = JSON.parse(String(_r.body))
+        data = [data;get(r, "data", [])]
+        skiptoken = get(r, "\$skipToken", "")
+
+        if skiptoken == ""
+            break
+        end
+    end
+
+    if manager.show_quota
+        @info "Quota after getting instances for scaleset pruning" remaining_resource(_r)
+    end
+
+    data
+end

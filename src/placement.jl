@@ -27,6 +27,73 @@ struct WorkerPlacement
     omp_threads::Int
 end
 
+function parse_cpu_list(value::AbstractString)
+    cpus = Int[]
+    for part in split(value, ',')
+        cpu_range = split(strip(part), '-')
+        if length(cpu_range) == 1
+            push!(cpus, parse(Int, cpu_range[1]))
+        elseif length(cpu_range) == 2
+            append!(cpus, parse(Int, cpu_range[1]):parse(Int, cpu_range[2]))
+        else
+            throw(ArgumentError("invalid CPU list: $value"))
+        end
+    end
+    sort(unique(cpus))
+end
+
+function parse_lscpu_json_topology(text::AbstractString)
+    data = JSON.parse(text)
+    fields = Dict{String,String}()
+    for entry in get(data, "lscpu", [])
+        key = replace(get(entry, "field", ""), r":$" => "")
+        fields[key] = get(entry, "data", "")
+    end
+
+    sockets_count = parse(Int, fields["Socket(s)"])
+    cores_per_socket = parse(Int, fields["Core(s) per socket"])
+    threads_per_core = parse(Int, get(fields, "Thread(s) per core", "1"))
+    physical_cores = sockets_count * cores_per_socket
+    logical_cpus = if haskey(fields, "On-line CPU(s) list")
+        parse_cpu_list(fields["On-line CPU(s) list"])
+    else
+        collect(0:(parse(Int, fields["CPU(s)"]) - 1))
+    end
+
+    physical_cpus = logical_cpus[1:physical_cores]
+    sockets = SocketTopology[]
+    for socket in 0:(sockets_count - 1)
+        first_index = socket * cores_per_socket + 1
+        last_index = first_index + cores_per_socket - 1
+        push!(sockets, SocketTopology(socket, physical_cpus[first_index:last_index]))
+    end
+
+    numa_nodes = NumaTopology[]
+    for (key, value) in sort(collect(fields); by=first)
+        match_result = match(r"^NUMA node([0-9]+) CPU\(s\)$", key)
+        match_result === nothing && continue
+
+        node_id = parse(Int, match_result.captures[1])
+        cpu_set = intersect(parse_cpu_list(value), physical_cpus)
+        socket = domain_for_cpu_set(cpu_set, sockets)
+        push!(numa_nodes, NumaTopology(node_id, cpu_set, socket))
+    end
+
+    if isempty(numa_nodes)
+        numa_nodes = [
+            NumaTopology(socket.id, socket.cpu_set, socket.id)
+            for socket in sockets
+        ]
+    end
+
+    MachineTopology(
+        physical_cores,
+        physical_cpus,
+        sockets,
+        numa_nodes,
+        threads_per_core > 1 || length(logical_cpus) > physical_cores)
+end
+
 function parse_lscpu_topology(text::AbstractString)
     first_cpu_by_core = Dict{Tuple{Int,Int},Int}()
     socket_by_cpu = Dict{Int,Int}()
@@ -105,6 +172,11 @@ function topology_domains(
 end
 
 function detect_machine_topology()
+    try
+        return parse_lscpu_json_topology(read(`lscpu --json`, String))
+    catch
+    end
+
     output = try
         read(`lscpu -p=CPU,CORE,SOCKET,NODE`, String)
     catch

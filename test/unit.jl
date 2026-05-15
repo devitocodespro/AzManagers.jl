@@ -27,6 +27,17 @@ function synthetic_lscpu()
     """
 end
 
+function synthetic_lscpu_json()
+    JSON.json(Dict("lscpu" => [
+        Dict("field" => "CPU(s):", "data" => "16"),
+        Dict("field" => "On-line CPU(s) list:", "data" => "0-15"),
+        Dict("field" => "Thread(s) per core:", "data" => "2"),
+        Dict("field" => "Core(s) per socket:", "data" => "4"),
+        Dict("field" => "Socket(s):", "data" => "2"),
+        Dict("field" => "NUMA node0 CPU(s):", "data" => "0-3,8-11"),
+        Dict("field" => "NUMA node1 CPU(s):", "data" => "4-7,12-15")]))
+end
+
 function uneven_topology()
     sockets = [SocketTopology(0, collect(0:9))]
     numa_nodes = [NumaTopology(0, collect(0:9), 0)]
@@ -137,6 +148,14 @@ end
     @test getfield.(topology.numa_nodes, :id) == [0, 1]
     @test getfield.(topology.numa_nodes, :cpu_set) ==
         [collect(0:1), collect(2:3)]
+
+    json_topology = AzManagers.parse_lscpu_json_topology(synthetic_lscpu_json())
+    @test json_topology.physical_cores == 8
+    @test json_topology.hyperthreading
+    @test getfield.(json_topology.sockets, :cpu_set) ==
+        [collect(0:3), collect(4:7)]
+    @test getfield.(json_topology.numa_nodes, :cpu_set) ==
+        [collect(0:3), collect(4:7)]
 end
 
 @testset "unit: worker_per_vm alias" begin

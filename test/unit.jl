@@ -1,10 +1,68 @@
 using AzManagers, HTTP, JSON, Test
 
+function synthetic_topology()
+    sockets = [
+        SocketTopology(0, collect(0:7)),
+        SocketTopology(1, collect(8:15))]
+    numa_nodes = [
+        NumaTopology(0, collect(0:3), 0),
+        NumaTopology(1, collect(4:7), 0),
+        NumaTopology(2, collect(8:11), 1),
+        NumaTopology(3, collect(12:15), 1)]
+
+    MachineTopology(16, collect(0:15), sockets, numa_nodes, false)
+end
+
 @testset "unit: Azure URL helpers" begin
     expected_url = "https://management.azure.com/subscriptions/sub/" *
         "providers/Microsoft.Compute/locations/eastus/usages?api-version=2019-07-01"
 
     @test AzManagers.azure_compute_usages_url("sub", "eastus") == expected_url
+end
+
+@testset "unit: automatic worker placement" begin
+    topology = synthetic_topology()
+
+    one_worker = plan_worker_placements(topology, 1)
+    @test length(one_worker) == 1
+    @test one_worker[1].cpu_set == collect(0:15)
+    @test one_worker[1].julia_threads == 16
+
+    socket_workers = plan_worker_placements(topology, 2)
+    @test getfield.(socket_workers, :socket) == [0, 1]
+    @test getfield.(socket_workers, :cpu_set) == [collect(0:7), collect(8:15)]
+
+    numa_workers = plan_worker_placements(topology, 4)
+    @test getfield.(numa_workers, :numa_node) == [0, 1, 2, 3]
+    @test all(worker -> worker.julia_threads == 4, numa_workers)
+
+    split_workers = plan_worker_placements(topology, 8)
+    @test length(split_workers) == 8
+    @test getfield.(split_workers, :cpu_set)[1] == [0, 1]
+    @test getfield.(split_workers, :cpu_set)[end] == [14, 15]
+
+    @test_throws ArgumentError plan_worker_placements(topology, 17)
+end
+
+@testset "unit: placement launch details" begin
+    topology = synthetic_topology()
+    placement = plan_worker_placements(topology, 4)[2]
+
+    @test AzManagers.cpu_set_string([0, 1, 2, 4, 5, 8]) == "0-2,4-5,8"
+    @test AzManagers.julia_threads_string(placement) == "4,1"
+    @test AzManagers.numactl_arguments(placement) ==
+        ["--physcpubind=4-7", "--membind=1"]
+
+    env = AzManagers.placement_environment(placement)
+    @test env["JULIA_NUM_THREADS"] == "4,1"
+    @test env["OMP_NUM_THREADS"] == "4"
+    @test env["OMP_PROC_BIND"] == "close"
+    @test env["OMP_PLACES"] == "cores"
+
+    metadata = AzManagers.worker_placement_metadata(topology, placement, 4)
+    @test metadata["worker_per_vm"] == 4
+    @test metadata["cpu_set"] == "4-7"
+    @test metadata["pinning_backend"] == "numactl"
 end
 
 @testset "unit: VM template resource IDs" begin

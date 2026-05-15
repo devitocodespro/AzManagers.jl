@@ -24,10 +24,12 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [weakdeps]
+Hwloc = "0e44f5e4-bd66-52a0-8798-143a42290a1d"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
 ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 
 [extensions]
+HwlocExt = "Hwloc"
 MPIExt = "MPI"
 ThreadPinningExt = "ThreadPinning"
 
@@ -38,11 +40,13 @@ HTTP = "1"
 JSON = "0.21, 1"
 JWTs = "0.3"
 LibCURL = "0.6, 1"
+Hwloc = "2, 3"
 MPI = "0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20"
 ThreadPinning = "0.7, 1"
 TOML = "1"
 julia = "^1.4"
 
 [extras]
+Hwloc = "0e44f5e4-bd66-52a0-8798-143a42290a1d"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
 ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"

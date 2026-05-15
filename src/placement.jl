@@ -224,7 +224,14 @@ function detect_machine_topology()
     parse_lscpu_topology(output)
 end
 
-_hwloc_topology() = throw(ErrorException("Hwloc.jl extension not loaded"))
+"""
+    _hwloc_topology()
+
+Loaded by `HwlocExt` when `Hwloc.jl` is available; without the extension this
+function has no methods and `detect_machine_topology` will skip it after
+catching the `MethodError`.
+"""
+function _hwloc_topology end
 
 function resolve_worker_per_vm(ppi::Int, worker_per_vm)
     if worker_per_vm === nothing

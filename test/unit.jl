@@ -185,7 +185,7 @@ end
 end
 
 @testset "unit: Hwloc topology stub without extension" begin
-    @test_throws ErrorException AzManagers._hwloc_topology()
+    @test_throws MethodError AzManagers._hwloc_topology()
 end
 
 @testset "unit: worker_per_vm alias" begin

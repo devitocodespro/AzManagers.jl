@@ -292,6 +292,18 @@ function numactl_prefix(placement::WorkerPlacement)
     "numactl " * join(numactl_arguments(placement), " ") * " "
 end
 
+function worker_launch_command(
+        exename,
+        exeflags,
+        placement::WorkerPlacement;
+        use_numactl::Bool)
+    threads = julia_threads_string(placement)
+    if use_numactl
+        return `numactl $(numactl_arguments(placement)) $exename $exeflags -t $threads --worker`
+    end
+    `$exename $exeflags -t $threads --worker`
+end
+
 function placement_environment(placement::WorkerPlacement)
     Dict(
         "JULIA_NUM_THREADS" => julia_threads_string(placement),

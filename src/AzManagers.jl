@@ -1212,21 +1212,40 @@ function azure_worker_init(cookie, master_address, master_port, ppi, exeflags, m
 
     _r = HTTP.request("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01", ["Metadata"=>"true"]; redirect=false)
     r = JSON.parse(String(_r.body))
+    userdata = Dict(
+        "subscriptionid" => lowercase(r["compute"]["subscriptionId"]),
+        "resourcegroup" => lowercase(r["compute"]["resourceGroupName"]),
+        "scalesetname" => lowercase(r["compute"]["vmScaleSetName"]),
+        "instanceid" => split(r["compute"]["resourceId"], '/')[end],
+        "priority" => get(r["compute"], "priority", ""),
+        "localid" => 1,
+        "name" => r["compute"]["name"],
+        "mpi" => mpi_size > 0,
+        "mpi_size" => mpi_size,
+        "physical_hostname" => azure_physical_name())
+
+    if mpi_size == 0 && ppi > 0
+        try
+            topology = detect_machine_topology()
+            placement = plan_worker_placements(topology, ppi)[1]
+            pinned = pin_julia_threads(placement.cpu_set)
+            backend = pinned ? "ThreadPinning" : "none"
+            merge!(userdata, worker_placement_metadata(
+                topology,
+                placement,
+                ppi;
+                pinning_backend = backend))
+        catch e
+            @debug "unable to apply initial worker placement"
+            logerror(e, Logging.Debug)
+        end
+    end
+
     vm = Dict(
         "exeflags" => exeflags,
         "bind_addr" => string(getipaddr(IPv4)),
         "ppi" => ppi,
-        "userdata" => Dict(
-            "subscriptionid" => lowercase(r["compute"]["subscriptionId"]),
-            "resourcegroup" => lowercase(r["compute"]["resourceGroupName"]),
-            "scalesetname" => lowercase(r["compute"]["vmScaleSetName"]),
-            "instanceid" => split(r["compute"]["resourceId"], '/')[end],
-            "priority" => get(r["compute"], "priority", ""),
-            "localid" => 1,
-            "name" => r["compute"]["name"],
-            "mpi" => mpi_size > 0,
-            "mpi_size" => mpi_size,
-            "physical_hostname" => azure_physical_name()))
+        "userdata" => userdata)
 
     _vm = base64encode(JSON.json(vm))
 

@@ -150,7 +150,8 @@ end
 function worker_placement_metadata(
         topology::MachineTopology,
         placement::WorkerPlacement,
-        worker_per_vm::Int)
+        worker_per_vm::Int;
+        pinning_backend = "numactl")
     Dict(
         "localid" => placement.localid,
         "worker_per_vm" => worker_per_vm,
@@ -161,7 +162,7 @@ function worker_placement_metadata(
         "cpu_set" => cpu_set_string(placement.cpu_set),
         "numa_node" => placement.numa_node,
         "socket" => placement.socket,
-        "pinning_backend" => "numactl")
+        "pinning_backend" => pinning_backend)
 end
 
 const PLACEMENT_USERDATA_KEYS = Set([

@@ -108,6 +108,12 @@ end
     @test metadata["worker_per_vm"] == 4
     @test metadata["cpu_set"] == "4-7"
     @test metadata["pinning_backend"] == "numactl"
+    thread_metadata = AzManagers.worker_placement_metadata(
+        topology,
+        placement,
+        4;
+        pinning_backend = "ThreadPinning")
+    @test thread_metadata["pinning_backend"] == "ThreadPinning"
     @test AzManagers.placement_userdata(metadata) == metadata
     @test AzManagers.numactl_prefix(placement) ==
         "numactl --physcpubind=4-7 --membind=1 "

@@ -27,6 +27,15 @@ struct WorkerPlacement
     omp_threads::Int
 end
 
+struct MpiRankPlacement
+    worker_localid::Int
+    rank_index::Int
+    cpu_set::Vector{Int}
+    numa_node::Union{Int,Nothing}
+    socket::Union{Int,Nothing}
+    omp_threads::Int
+end
+
 function parse_cpu_list(value::AbstractString)
     cpus = Int[]
     for part in split(value, ',')
@@ -244,10 +253,10 @@ function resolve_worker_per_vm(ppi::Int, worker_per_vm)
 end
 
 function validate_worker_per_vm_options(worker_per_vm::Int, mpi_ranks_per_worker::Int)
-    if worker_per_vm > 1 && mpi_ranks_per_worker > 0
-        throw(ArgumentError(
-            "worker_per_vm > 1 with mpi_ranks_per_worker > 0 is not supported yet"))
-    end
+    worker_per_vm > 0 ||
+        throw(ArgumentError("worker_per_vm must be positive"))
+    mpi_ranks_per_worker >= 0 ||
+        throw(ArgumentError("mpi_ranks_per_worker cannot be negative"))
     nothing
 end
 
@@ -411,12 +420,72 @@ function plan_worker_placements(topology::MachineTopology, worker_per_vm::Int)
     ]
 end
 
+function plan_mpi_rank_placements(
+        placement::WorkerPlacement,
+        mpi_ranks_per_worker::Int)
+    mpi_ranks_per_worker > 0 ||
+        throw(ArgumentError("mpi_ranks_per_worker must be positive"))
+    if mpi_ranks_per_worker > length(placement.cpu_set)
+        throw(ArgumentError(
+            "mpi_ranks_per_worker $(mpi_ranks_per_worker) exceeds the " *
+            "worker CPU count $(length(placement.cpu_set))"))
+    end
+
+    chunks = split_evenly(placement.cpu_set, mpi_ranks_per_worker)
+    if rem(length(placement.cpu_set), mpi_ranks_per_worker) != 0
+        @warn "MPI ranks do not divide CPU set evenly" worker_localid=placement.localid cpu_count=length(placement.cpu_set) mpi_ranks_per_worker
+    end
+
+    [
+        MpiRankPlacement(
+            placement.localid,
+            rank_index - 1,
+            chunk,
+            placement.numa_node,
+            placement.socket,
+            length(chunk))
+        for (rank_index, chunk) in enumerate(chunks)
+    ]
+end
+
+function plan_mpi_placements(
+        topology::MachineTopology,
+        worker_per_vm::Int,
+        mpi_ranks_per_worker::Int)
+    worker_placements = plan_worker_placements(topology, worker_per_vm)
+    [
+        (placement, plan_mpi_rank_placements(placement, mpi_ranks_per_worker))
+        for placement in worker_placements
+    ]
+end
+
 function numactl_arguments(placement::WorkerPlacement)
     args = ["--physcpubind=$(cpu_set_string(placement.cpu_set))"]
     if placement.numa_node !== nothing
         push!(args, "--membind=$(placement.numa_node)")
     end
     args
+end
+
+function numactl_arguments(placement::MpiRankPlacement)
+    args = ["--physcpubind=$(cpu_set_string(placement.cpu_set))"]
+    if placement.numa_node !== nothing
+        push!(args, "--membind=$(placement.numa_node)")
+    end
+    args
+end
+
+function mpirun_command(
+        placement::WorkerPlacement,
+        ranks::Vector{MpiRankPlacement},
+        exename,
+        rank_payload::AbstractString;
+        extra_flags::AbstractString = "")
+    isempty(ranks) && throw(ArgumentError("rank list must be non-empty"))
+    cpu_list = cpu_set_string(placement.cpu_set)
+    base = "mpirun -n $(length(ranks)) --cpu-set $(cpu_list) --bind-to cpu-list:ordered"
+    flags = isempty(strip(extra_flags)) ? "" : " " * strip(extra_flags)
+    base * flags * " " * exename * " " * rank_payload
 end
 
 function numactl_prefix(placement::WorkerPlacement)

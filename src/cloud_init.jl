@@ -108,6 +108,43 @@ function buildstartupscript(manager::AzManager, exename::String, user::String, d
     cmd, remote_julia_environment_name
 end
 
+function nested_mpi_launch_block(
+        exename::AbstractString,
+        exeflags::AbstractString,
+        ppi::Int,
+        mpi_ranks_per_worker::Int,
+        mpi_flags,
+        cookie::AbstractString,
+        master_address::AbstractString,
+        master_port::Int,
+        juliaenvstring::AbstractString)
+
+    rank_payload = "$(juliaenvstring)using AzManagers, MPI; AzManagers.azure_worker_mpi(\"$cookie\", \"$master_address\", $master_port, $ppi, \"$exeflags\")"
+
+    """
+    AZM_WORKER_CPU_SETS=( \$($exename -e 'using AzManagers; topology = AzManagers.detect_machine_topology(); for placement in AzManagers.plan_worker_placements(topology, $ppi); print(AzManagers.cpu_set_string(placement.cpu_set), " "); end') )
+
+    if [ \${#AZM_WORKER_CPU_SETS[@]} -ne $ppi ]; then
+        echo "expected $ppi worker cpu-sets but got \${#AZM_WORKER_CPU_SETS[@]}" >&2
+        exit 1
+    fi
+
+    AZM_PIDS=()
+    for cpu_set in "\${AZM_WORKER_CPU_SETS[@]}"; do
+        mpirun -n $mpi_ranks_per_worker --cpu-set "\$cpu_set" --bind-to cpu-list:ordered $mpi_flags $exename $exeflags -e '$rank_payload' &
+        AZM_PIDS+=(\$!)
+    done
+
+    exit_code=0
+    for pid in "\${AZM_PIDS[@]}"; do
+        if ! wait \$pid; then
+            child_status=\$?
+            exit_code=\$child_status
+        fi
+    done
+    """
+end
+
 function buildstartupscript_cluster(manager::AzManager, spot::Bool, ppi::Int, mpi_ranks_per_worker::Int, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig, julia_num_threads::String, omp_num_threads::Int, exename::String, exeflags::String, env::Dict, user::String,
         disk::AbstractString, custom_environment::Bool, use_lvm::Bool)
 
@@ -171,7 +208,7 @@ function buildstartupscript_cluster(manager::AzManager, spot::Bool, ppi::Int, mp
             echo "the worker has finished running with exit code \$exit_code."
             EOF
             """
-        else
+        elseif ppi == 1
             shell_cmds *= """
 
             $exename -e '$(juliaenvstring)try using AzManagers; catch; using Pkg; Pkg.instantiate(); using AzManagers; end; AzManagers.nvidia_gpucheck($nvidia_enable_ecc, $nvidia_enable_mig); AzManagers.mount_datadisks(); AzManagers.build_lvm()'
@@ -183,6 +220,35 @@ function buildstartupscript_cluster(manager::AzManager, spot::Bool, ppi::Int, mp
                 mpirun -n $mpi_ranks_per_worker $mpi_flags $exename $_exeflags -e '$(juliaenvstring)using AzManagers, MPI; AzManagers.azure_worker_mpi("$cookie", "$master_address", $master_port, $ppi, "$_exeflags")'
 
                 exit_code=\$?
+                echo "attempt \$attempt_number is done with exit code \$exit_code...."
+
+                if [ "\$exit_code" == "42" ]; then
+                    echo "...breaking from retry loop due to exit code 42."
+                    break
+                fi
+
+                echo "...trying again after sleeping for 5 seconds..."
+                sleep 5
+                attempt_number=\$(( attempt_number + 1 ))
+
+                echo "the worker startup was tried \$attempt_number times."
+            done
+            echo "the worker has finished running with exit code \$exit_code."
+            EOF
+            """
+        else
+            nested_block = nested_mpi_launch_block(
+                exename, _exeflags, ppi, mpi_ranks_per_worker, mpi_flags,
+                cookie, master_address, master_port, juliaenvstring)
+            shell_cmds *= """
+
+            $exename -e '$(juliaenvstring)try using AzManagers; catch; using Pkg; Pkg.instantiate(); using AzManagers; end; AzManagers.nvidia_gpucheck($nvidia_enable_ecc, $nvidia_enable_mig); AzManagers.mount_datadisks(); AzManagers.build_lvm()'
+
+            attempt_number=1
+            maximum_attempts=5
+            exit_code=0
+            while [  \$attempt_number -le \$maximum_attempts ]; do
+                $nested_block
                 echo "attempt \$attempt_number is done with exit code \$exit_code...."
 
                 if [ "\$exit_code" == "42" ]; then
@@ -246,7 +312,7 @@ function buildstartupscript_cluster(manager::AzManager, spot::Bool, ppi::Int, mp
             echo "the worker has finished running with exit code \$exit_code."
             EOF
             """
-        else
+        elseif ppi == 1
             shell_cmds *= """
 
             $exename -e '$(juliaenvstring)try using AzManagers; catch; using Pkg; Pkg.instantiate(); using AzManagers; end; AzManagers.nvidia_gpucheck($nvidia_enable_ecc, $nvidia_enable_mig); AzManagers.mount_datadisks()'
@@ -258,6 +324,35 @@ function buildstartupscript_cluster(manager::AzManager, spot::Bool, ppi::Int, mp
                 mpirun -n $mpi_ranks_per_worker $mpi_flags $exename $_exeflags -e '$(juliaenvstring)using AzManagers, MPI; AzManagers.azure_worker_mpi("$cookie", "$master_address", $master_port, $ppi, "$_exeflags")'
 
                 exit_code=\$?
+                echo "attempt \$attempt_number is done with exit code \$exit_code...."
+
+                if [ "\$exit_code" == "42" ]; then
+                    echo "...breaking from retry loop due to exit code 42."
+                    break
+                fi
+
+                echo "...trying again after sleeping for 5 seconds..."
+                sleep 5
+                attempt_number=\$(( attempt_number + 1 ))
+
+                echo "the worker startup was tried \$attempt_number times."
+            done
+            echo "the worker has finished running with exit code \$exit_code."
+            EOF
+            """
+        else
+            nested_block = nested_mpi_launch_block(
+                exename, _exeflags, ppi, mpi_ranks_per_worker, mpi_flags,
+                cookie, master_address, master_port, juliaenvstring)
+            shell_cmds *= """
+
+            $exename -e '$(juliaenvstring)try using AzManagers; catch; using Pkg; Pkg.instantiate(); using AzManagers; end; AzManagers.nvidia_gpucheck($nvidia_enable_ecc, $nvidia_enable_mig); AzManagers.mount_datadisks()'
+
+            attempt_number=1
+            maximum_attempts=5
+            exit_code=0
+            while [  \$attempt_number -le \$maximum_attempts ]; do
+                $nested_block
                 echo "attempt \$attempt_number is done with exit code \$exit_code...."
 
                 if [ "\$exit_code" == "42" ]; then

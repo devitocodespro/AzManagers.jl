@@ -195,7 +195,85 @@ end
     @test_throws ArgumentError AzManagers.resolve_worker_per_vm(2, 4)
     @test isnothing(AzManagers.validate_worker_per_vm_options(4, 0))
     @test isnothing(AzManagers.validate_worker_per_vm_options(1, 2))
-    @test_throws ArgumentError AzManagers.validate_worker_per_vm_options(2, 1)
+    @test isnothing(AzManagers.validate_worker_per_vm_options(2, 1))
+    @test_throws ArgumentError AzManagers.validate_worker_per_vm_options(0, 0)
+    @test_throws ArgumentError AzManagers.validate_worker_per_vm_options(1, -1)
+end
+
+@testset "unit: MPI rank placement planning" begin
+    topology = synthetic_topology()
+    worker_placements = plan_worker_placements(topology, 2)
+
+    even_ranks = AzManagers.plan_mpi_rank_placements(worker_placements[1], 4)
+    @test length(even_ranks) == 4
+    @test getfield.(even_ranks, :rank_index) == 0:3
+    @test getfield.(even_ranks, :cpu_set) ==
+        [[0, 1], [2, 3], [4, 5], [6, 7]]
+    @test all(rank -> rank.worker_localid == 1, even_ranks)
+    @test all(rank -> rank.omp_threads == 2, even_ranks)
+
+    second_worker_ranks = AzManagers.plan_mpi_rank_placements(
+        worker_placements[2], 2)
+    @test getfield.(second_worker_ranks, :cpu_set) ==
+        [collect(8:11), collect(12:15)]
+
+    @test_logs (:warn,) begin
+        uneven = AzManagers.plan_mpi_rank_placements(worker_placements[1], 3)
+        @test length.(getfield.(uneven, :cpu_set)) == [3, 3, 2]
+    end
+
+    @test_throws ArgumentError AzManagers.plan_mpi_rank_placements(worker_placements[1], 0)
+    @test_throws ArgumentError AzManagers.plan_mpi_rank_placements(worker_placements[1], 99)
+
+    nested = AzManagers.plan_mpi_placements(topology, 2, 2)
+    @test length(nested) == 2
+    @test all(((wp, ranks),) -> length(ranks) == 2, nested)
+    @test nested[1][1].cpu_set == collect(0:7)
+    @test nested[2][2][2].cpu_set == collect(12:15)
+    @test nested[2][2][1].worker_localid == 2
+end
+
+@testset "unit: nested MPI launch block" begin
+    block = AzManagers.nested_mpi_launch_block(
+        "julia",
+        "-t 4,1",
+        2,
+        4,
+        "--report-bindings",
+        "abc",
+        "10.0.0.1",
+        9009,
+        "")
+
+    @test contains(block, "AZM_WORKER_CPU_SETS=(")
+    @test contains(block, "AzManagers.plan_worker_placements(topology, 2)")
+    @test contains(block, "mpirun -n 4 --cpu-set ")
+    @test contains(block, "--bind-to cpu-list:ordered --report-bindings")
+    @test contains(block, "azure_worker_mpi(\"abc\", \"10.0.0.1\", 9009, 2,")
+    @test contains(block, "AZM_PIDS+=(\$!)")
+    @test contains(block, "for pid in \"\${AZM_PIDS[@]}\"")
+end
+
+@testset "unit: mpirun command rendering" begin
+    topology = synthetic_topology()
+    placement, ranks = AzManagers.plan_mpi_placements(topology, 2, 2)[1]
+
+    cmd = AzManagers.mpirun_command(
+        placement,
+        ranks,
+        "julia",
+        "-e 'using AzManagers; AzManagers.azure_worker_mpi(...)'";
+        extra_flags = "--report-bindings")
+
+    @test startswith(cmd, "mpirun -n 2 --cpu-set 0-7 --bind-to cpu-list:ordered")
+    @test contains(cmd, "--report-bindings")
+    @test endswith(cmd, "azure_worker_mpi(...)'")
+
+    @test_throws ArgumentError AzManagers.mpirun_command(
+        placement,
+        AzManagers.MpiRankPlacement[],
+        "julia",
+        "")
 end
 
 @testset "unit: placement launch details" begin

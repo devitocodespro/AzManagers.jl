@@ -31,6 +31,7 @@ include("placement.jl")
 include("azure_api.jl")
 include("cluster_manager.jl")
 include("cloud_init.jl")
+include("detached.jl")
 
 """
     AzManagers.write_manifest(;resourcegroup="", subscriptionid="", ssh_user="", ssh_public_key_file="~/.ssh/azmanagers_rsa.pub", ssh_private_key_file="~/.ssh/azmanagers_rsa")
@@ -2491,19 +2492,6 @@ end
 #
 # detached service and REST API
 #
-const DETACHED_ROUTER = HTTP.Router()
-
-mutable struct DetachedServiceState
-    jobs::Dict{String,Dict{String,Any}}
-    vm::Base.RefValue{Dict{String,String}}
-end
-
-const DETACHED_STATE = DetachedServiceState(
-    Dict{String,Dict{String,Any}}(),
-    Ref(Dict{String,String}()))
-const DETACHED_JOBS = DETACHED_STATE.jobs
-const DETACHED_VM = DETACHED_STATE.vm
-
 let DETACHED_ID::Int = 1
     global detached_nextid
     detached_nextid() = (id = DETACHED_ID; DETACHED_ID += 1; id)

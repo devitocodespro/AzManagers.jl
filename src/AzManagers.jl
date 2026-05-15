@@ -1488,10 +1488,58 @@ function Distributed.launch_n_additional_processes(manager::AzManager, frompid, 
     @sync begin
         exename = Distributed.notnothing(fromconfig.exename)
         exeflags = something(fromconfig.exeflags, ``)
-        cmd = `$exename $exeflags --worker`
 
-        new_addresses = remotecall_fetch(Distributed.launch_additional, frompid, cnt, cmd)
-        for (localid,address) in enumerate(new_addresses)
+        placement_info = try
+            remotecall_fetch(frompid, cnt + 1) do worker_per_vm
+                topology = AzManagers.detect_machine_topology()
+                placements = AzManagers.plan_worker_placements(topology, worker_per_vm)
+                use_numactl = Sys.which("numactl") !== nothing
+                topology, placements, use_numactl
+            end
+        catch e
+            @warn "unable to infer local worker placement; using default launcher"
+            logerror(e, Logging.Debug)
+            nothing
+        end
+
+        if placement_info === nothing
+            cmd = `$exename $exeflags --worker`
+            new_addresses = remotecall_fetch(Distributed.launch_additional, frompid, cnt, cmd)
+            add_launched_workers(manager, frompid, fromconfig, new_addresses, launched_q)
+            return
+        end
+
+        topology, placements, use_numactl = placement_info
+        merge!(
+            fromconfig.userdata,
+            worker_placement_metadata(topology, placements[1], cnt + 1))
+
+        for placement in placements[2:end]
+            cmd = worker_launch_command(exename, exeflags, placement; use_numactl)
+            new_addresses = remotecall_fetch(Distributed.launch_additional, frompid, 1, cmd)
+            add_launched_workers(
+                manager,
+                frompid,
+                fromconfig,
+                new_addresses,
+                launched_q;
+                topology,
+                placement,
+                worker_per_vm = cnt + 1)
+        end
+    end
+end
+
+function add_launched_workers(
+        manager::AzManager,
+        frompid,
+        fromconfig,
+        new_addresses,
+        launched_q;
+        topology = nothing,
+        placement = nothing,
+        worker_per_vm = nothing)
+    for (localid,address) in enumerate(new_addresses)
             (bind_addr, port) = address
 
             wconfig = Distributed.WorkerConfig()
@@ -1502,11 +1550,17 @@ function Distributed.launch_n_additional_processes(manager::AzManager, frompid, 
             wconfig.port = port
             wconfig.count = fromconfig.count
             wconfig.userdata = Dict(
-                "localid" => localid+1,
+                "localid" => placement === nothing ? localid + 1 : placement.localid,
                 "name" => fromconfig.userdata["name"],
                 "subscriptionid" => fromconfig.userdata["subscriptionid"],
                 "resourcegroup" => fromconfig.userdata["resourcegroup"],
                 "scalesetname" => fromconfig.userdata["scalesetname"])
+
+            if placement !== nothing && topology !== nothing && worker_per_vm !== nothing
+                merge!(
+                    wconfig.userdata,
+                    worker_placement_metadata(topology, placement, worker_per_vm))
+            end
 
             let wconfig=wconfig
                 @async begin
@@ -1516,7 +1570,6 @@ function Distributed.launch_n_additional_processes(manager::AzManager, frompid, 
                 end
             end
         end
-    end
 end
 
 #

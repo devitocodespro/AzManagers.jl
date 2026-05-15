@@ -98,6 +98,12 @@ end
     @test AzManagers.placement_userdata(metadata) == metadata
     @test AzManagers.numactl_prefix(placement) ==
         "numactl --physcpubind=4-7 --membind=1 "
+    @test AzManagers.worker_launch_command(
+        "julia",
+        ``,
+        placement;
+        use_numactl = true) ==
+            `numactl --physcpubind=4-7 --membind=1 julia -t 4,1 --worker`
 end
 
 @testset "unit: shell environment rendering" begin

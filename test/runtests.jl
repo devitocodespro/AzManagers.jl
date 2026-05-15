@@ -1,6 +1,8 @@
 using Distributed, AzManagers, Random, TOML, Test, HTTP, AzSessions, JSON, Pkg
 using MPI
 
+include("unit.jl")
+
 session = AzSession(;protocal=AzClientCredentials)
 
 azmanagers_pinfo = Pkg.project()
@@ -414,7 +416,7 @@ end
 end
 
 @testset "AzManagers, nphysical_cores $templatename" begin
-    templates_scaleset = JSON.parse(read(AzManagers.templates_filename_vm(), String))
+    templates_vm = JSON.parse(read(AzManagers.templates_filename_vm(), String))
     template = templates_vm[templatename] 
     ncores = nphysical_cores(template)
 

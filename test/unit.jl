@@ -13,6 +13,20 @@ function synthetic_topology()
     MachineTopology(16, collect(0:15), sockets, numa_nodes, false)
 end
 
+function synthetic_lscpu()
+    """
+    # CPU,Core,Socket,Node
+    0,0,0,0
+    1,1,0,0
+    2,2,0,1
+    3,3,0,1
+    4,0,0,0
+    5,1,0,0
+    6,2,0,1
+    7,3,0,1
+    """
+end
+
 @testset "unit: Azure URL helpers" begin
     expected_url = "https://management.azure.com/subscriptions/sub/" *
         "providers/Microsoft.Compute/locations/eastus/usages?api-version=2019-07-01"
@@ -44,6 +58,24 @@ end
     @test_throws ArgumentError plan_worker_placements(topology, 17)
 end
 
+@testset "unit: lscpu topology parsing" begin
+    topology = AzManagers.parse_lscpu_topology(synthetic_lscpu())
+
+    @test topology.physical_cores == 4
+    @test topology.logical_cpus == collect(0:3)
+    @test topology.hyperthreading
+    @test getfield.(topology.numa_nodes, :id) == [0, 1]
+    @test getfield.(topology.numa_nodes, :cpu_set) ==
+        [collect(0:1), collect(2:3)]
+end
+
+@testset "unit: worker_per_vm alias" begin
+    @test AzManagers.resolve_worker_per_vm(4, nothing) == 4
+    @test AzManagers.resolve_worker_per_vm(1, 4) == 4
+    @test AzManagers.resolve_worker_per_vm(4, 4) == 4
+    @test_throws ArgumentError AzManagers.resolve_worker_per_vm(2, 4)
+end
+
 @testset "unit: placement launch details" begin
     topology = synthetic_topology()
     placement = plan_worker_placements(topology, 4)[2]
@@ -63,6 +95,15 @@ end
     @test metadata["worker_per_vm"] == 4
     @test metadata["cpu_set"] == "4-7"
     @test metadata["pinning_backend"] == "numactl"
+end
+
+@testset "unit: shell environment rendering" begin
+    rendered = AzManagers.build_envstring(
+        Dict("FOO" => "bar baz", "QUOTE" => "a'b"))
+
+    @test contains(rendered, "export FOO='bar baz'")
+    @test contains(rendered, "export QUOTE='a'\"'\"'b'")
+    @test_throws ArgumentError AzManagers.build_envstring(Dict("1BAD" => "value"))
 end
 
 @testset "unit: VM template resource IDs" begin

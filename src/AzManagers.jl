@@ -818,6 +818,7 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
         group = "cbox",
         overprovision = true,
         ppi = 1,
+        worker_per_vm = nothing,
         julia_num_threads = VERSION >= v"1.9" ? "$(Threads.nthreads()),$(Threads.nthreads(:interactive))" : string(Threads.nthreads()),
         omp_num_threads = parse(Int, get(ENV, "OMP_NUM_THREADS", "1")),
         exename = "$(Sys.BINDIR)/julia",
@@ -840,6 +841,7 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
         hyperthreading = nothing,
         use_lvm = false)
     n_current_workers = nprocs() == 1 ? 0 : nworkers()
+    worker_count_per_vm = resolve_worker_per_vm(ppi, worker_per_vm)
 
     (subscriptionid == "" || resourcegroup == "" || user == "") && load_manifest()
     subscriptionid == "" && (subscriptionid = get(template, "subscriptionid", _manifest["subscriptionid"]))
@@ -862,13 +864,13 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
 
     @info "Provisioning $n virtual machines in scale-set $group..."
     _scalesets[scaleset] = scaleset_create_or_update(manager, user, scaleset.subscriptionid, scaleset.resourcegroup, scaleset.scalesetname, sigimagename,
-        sigimageversion, imagename, osdisksize, nretry, template, n, ppi, mpi_ranks_per_worker, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig,
+        sigimageversion, imagename, osdisksize, nretry, template, n, worker_count_per_vm, mpi_ranks_per_worker, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig,
         hyperthreading, julia_num_threads, omp_num_threads, exename, exeflags, env, spot, maxprice, spot_base_regular_priority_count, spot_regular_percentage_above_base,
         verbose, customenv, overprovision, use_lvm)
 
     if waitfor
         @info "Initiating cluster..."
-        spinner_tsk = @async spinner(n_current_workers + n)
+        spinner_tsk = @async spinner(n_current_workers + n * worker_count_per_vm)
         wait(spinner_tsk)
     end
 
@@ -1851,10 +1853,20 @@ function buildstartupscript(manager::AzManager, exename::String, user::String, d
     cmd, remote_julia_environment_name
 end
 
+function shell_quote(value)
+    "'" * replace(string(value), "'" => "'\"'\"'") * "'"
+end
+
+function valid_environment_name(name)
+    occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", string(name))
+end
+
 function build_envstring(env::Dict)
     envstring = ""
     for (key,value) in env
-        envstring *= "export $key=$value\n"
+        valid_environment_name(key) ||
+            throw(ArgumentError("invalid environment variable name: $key"))
+        envstring *= "export $key=$(shell_quote(value))\n"
     end
     envstring
 end

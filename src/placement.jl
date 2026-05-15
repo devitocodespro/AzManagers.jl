@@ -27,6 +27,102 @@ struct WorkerPlacement
     omp_threads::Int
 end
 
+function parse_lscpu_topology(text::AbstractString)
+    first_cpu_by_core = Dict{Tuple{Int,Int},Int}()
+    socket_by_cpu = Dict{Int,Int}()
+    numa_by_cpu = Dict{Int,Int}()
+    all_cpus = Int[]
+
+    for raw_line in split(text, '\n')
+        line = strip(raw_line)
+        (isempty(line) || startswith(line, "#")) && continue
+
+        fields = split(line, ',')
+        length(fields) >= 3 || continue
+
+        cpu = parse(Int, fields[1])
+        core = parse(Int, fields[2])
+        socket = parse(Int, fields[3])
+        numa_node = length(fields) >= 4 ? parse(Int, fields[4]) : socket
+
+        push!(all_cpus, cpu)
+        key = (socket, core)
+        first_cpu_by_core[key] = min(get(first_cpu_by_core, key, cpu), cpu)
+        socket_by_cpu[cpu] = socket
+        numa_by_cpu[cpu] = numa_node
+    end
+
+    physical_cpus = sort(collect(values(first_cpu_by_core)))
+    sockets = topology_domains(SocketTopology, physical_cpus, socket_by_cpu)
+    numa_nodes = topology_domains(
+        NumaTopology,
+        physical_cpus,
+        numa_by_cpu,
+        socket_by_cpu)
+
+    MachineTopology(
+        length(physical_cpus),
+        physical_cpus,
+        sockets,
+        numa_nodes,
+        length(all_cpus) > length(physical_cpus))
+end
+
+function topology_domains(
+        ::Type{SocketTopology},
+        cpus::Vector{Int},
+        socket_by_cpu::Dict{Int,Int})
+    by_socket = Dict{Int,Vector{Int}}()
+    for cpu in cpus
+        socket = socket_by_cpu[cpu]
+        push!(get!(by_socket, socket, Int[]), cpu)
+    end
+
+    [
+        SocketTopology(socket, sort(cpu_set))
+        for (socket, cpu_set) in sort(collect(by_socket); by=first)
+    ]
+end
+
+function topology_domains(
+        ::Type{NumaTopology},
+        cpus::Vector{Int},
+        numa_by_cpu::Dict{Int,Int},
+        socket_by_cpu::Dict{Int,Int})
+    by_numa = Dict{Int,Vector{Int}}()
+    for cpu in cpus
+        numa_node = numa_by_cpu[cpu]
+        push!(get!(by_numa, numa_node, Int[]), cpu)
+    end
+
+    nodes = NumaTopology[]
+    for (numa_node, cpu_set) in sort(collect(by_numa); by=first)
+        sockets = unique(socket_by_cpu[cpu] for cpu in cpu_set)
+        socket = length(sockets) == 1 ? first(sockets) : nothing
+        push!(nodes, NumaTopology(numa_node, sort(cpu_set), socket))
+    end
+    nodes
+end
+
+function detect_machine_topology()
+    output = try
+        read(`lscpu -p=CPU,CORE,SOCKET,NODE`, String)
+    catch
+        read(`lscpu -p=CPU,CORE,SOCKET`, String)
+    end
+    parse_lscpu_topology(output)
+end
+
+function resolve_worker_per_vm(ppi::Int, worker_per_vm)
+    if worker_per_vm === nothing
+        return ppi
+    end
+    if ppi != 1 && ppi != worker_per_vm
+        throw(ArgumentError("ppi and worker_per_vm cannot specify different values"))
+    end
+    worker_per_vm
+end
+
 function cpu_set_string(cpu_set::Vector{Int})
     isempty(cpu_set) && return ""
 
@@ -181,4 +277,15 @@ function placement_environment(placement::WorkerPlacement)
         "OMP_NUM_THREADS" => string(placement.omp_threads),
         "OMP_PROC_BIND" => "close",
         "OMP_PLACES" => "cores")
+end
+
+function pin_julia_threads(cpu_set::Vector{Int})
+    try
+        @eval using ThreadPinning
+        @eval ThreadPinning.pinthreads($cpu_set)
+        true
+    catch err
+        @debug "ThreadPinning.jl unavailable; relying on numactl pinning" err
+        false
+    end
 end

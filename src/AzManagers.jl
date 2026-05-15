@@ -23,6 +23,7 @@ manifestpath() = joinpath(homedir(), ".azmanagers")
 manifestfile() = joinpath(manifestpath(), "manifest.json")
 
 include("placement.jl")
+include("azure_api.jl")
 
 """
     AzManagers.write_manifest(;resourcegroup="", subscriptionid="", ssh_user="", ssh_public_key_file="~/.ssh/azmanagers_rsa.pub", ssh_private_key_file="~/.ssh/azmanagers_rsa")
@@ -60,117 +61,6 @@ function load_manifest()
         end
     else
         @error "Manifest file ($(AzManagers.manifestfile())) does not exist.  Use AzManagers.write_manifest to generate a manifest file."
-    end
-end
-
-const RETRYABLE_HTTP_ERRORS = (
-    409,  # Conflict
-    429,  # Too many requests
-    500)  # Internal server error
-
-function isretryable(e::HTTP.StatusError)
-    e.status ∈ RETRYABLE_HTTP_ERRORS && (return true)
-    false
-end
-isretryable(e::Base.IOError) = true
-isretryable(e::HTTP.Exceptions.ConnectError) = true
-isretryable(e::HTTP.Exceptions.HTTPError) = true
-isretryable(e::HTTP.Exceptions.RequestError) = true
-isretryable(e::HTTP.Exceptions.TimeoutError) = true
-isretryable(e::Base.EOFError) = true
-isretryable(e::Sockets.DNSError) = true
-isretryable(e) = false
-
-status(e::HTTP.StatusError) = e.status
-status(e) = 999
-
-function retrywarn(i, retries, s, e)
-    if isa(e, HTTP.ExceptionRequest.StatusError)
-        @debug "$(e.status): $(String(e.response.body)), retry $i of $retries, retrying in $s seconds"
-        if e.status == 429
-            remaining_resource = nothing
-            for header in e.response.headers
-                if header[1] == "x-ms-ratelimit-remaining-resource"
-                    remaining_resource = header
-                    break
-                end
-            end
-            @warn "The Azure service is throttling the request, asking to retry after $s seconds.  Quota information:" remaining_resource[2]
-        elseif e.status == 500
-            b = JSON.parse(String(e.response.body))
-            errorcode = get(get(b, "error", Dict()), "code", "")
-            @warn "errorcode: $errorcode, retry $i, retrying in $s seconds"
-        elseif e.status == 409
-            b = JSON.parse(String(e.response.body))
-            errorcode = get(get(b, "error", Dict()), "code", "")
-            errormessage = get(get(b, "error", Dict()), "message", "")
-            @warn "($errorcode): $errormessage; retry $i of $retries, retrying in $s seconds"
-        else
-            @warn "status=$(e.status): $(String(e.response.body)), retry $i of $retries, retrying in $s seconds"
-        end
-    else
-        @warn "warn: $(typeof(e)) -- retry $i, retrying in $s seconds"
-        logerror(e, Logging.Debug)
-    end
-end
-
-macro retry(retries, ex::Expr)
-    quote
-        r = nothing
-        for i = 0:$(esc(retries))
-            try
-                r = $(esc(ex))
-                break
-            catch e
-                (i < $(esc(retries)) && isretryable(e)) || throw(e)
-                maximum_backoff = 256
-                s = min(2.0^(i-1), maximum_backoff) + rand()
-                if status(e) ∈ (429,500)
-                    for header in e.response.headers
-                        if lowercase(header[1]) == "retry-after"
-                            s = parse(Int, header[2]) + rand()
-                            break
-                        end
-                    end
-                end
-                retrywarn(i, $(esc(retries)), s, e)
-                sleep(s)
-            end
-        end
-        r
-    end
-end
-
-function azrequest(rtype, verbose, url, headers, body=nothing)
-    if contains(url, "virtualMachineScaleSets")
-        manager = azmanager()
-        if isdefined(manager, :scaleset_request_counter)
-            manager.scaleset_request_counter += 1
-        else
-            manager.scaleset_request_counter = 1
-        end
-    end
-
-    options = (retry=false, status_exception=false)
-    if body === nothing
-        r = HTTP.request(rtype, url, headers; verbose=verbose, options...)
-    else
-        r = HTTP.request(rtype, url, headers, body; verbose=verbose, options...)
-    end
-    
-    if r.status >= 300
-        throw(HTTP.Exceptions.StatusError(r.status, r.request.method, r.request.target, r))
-    end
-    
-    r
-end
-
-function scaleset_request_counter()
-    manager = azmanager()
-    if isdefined(manager, :scaleset_request_counter)
-        return manager.scaleset_request_counter
-    else
-        return 1
     end
 end
 
@@ -1016,16 +906,6 @@ function Distributed.kill(manager::AzManager, id::Int, config::WorkerConfig)
 
     @debug "...kill, pushed."
     nothing
-end
-
-function remaining_resource(r)
-    _remaining_resource = ""
-    for header in r.headers
-        if header[1] == "x-ms-ratelimit-remaining-resource"
-            _remaining_resource = header[2]
-        end
-    end
-    _remaining_resource
 end
 
 """

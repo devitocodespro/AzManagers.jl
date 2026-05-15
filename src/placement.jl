@@ -123,6 +123,14 @@ function resolve_worker_per_vm(ppi::Int, worker_per_vm)
     worker_per_vm
 end
 
+function validate_worker_per_vm_options(worker_per_vm::Int, mpi_ranks_per_worker::Int)
+    if worker_per_vm > 1 && mpi_ranks_per_worker > 0
+        throw(ArgumentError(
+            "worker_per_vm > 1 with mpi_ranks_per_worker > 0 is not supported yet"))
+    end
+    nothing
+end
+
 function cpu_set_string(cpu_set::Vector{Int})
     isempty(cpu_set) && return ""
 

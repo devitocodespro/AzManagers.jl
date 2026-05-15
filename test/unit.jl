@@ -87,6 +87,9 @@ end
     @test AzManagers.resolve_worker_per_vm(1, 4) == 4
     @test AzManagers.resolve_worker_per_vm(4, 4) == 4
     @test_throws ArgumentError AzManagers.resolve_worker_per_vm(2, 4)
+    @test isnothing(AzManagers.validate_worker_per_vm_options(4, 0))
+    @test isnothing(AzManagers.validate_worker_per_vm_options(1, 2))
+    @test_throws ArgumentError AzManagers.validate_worker_per_vm_options(2, 1)
 end
 
 @testset "unit: placement launch details" begin

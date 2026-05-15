@@ -22,6 +22,8 @@ const _manifest = Dict("resourcegroup"=>"", "ssh_user"=>"", "ssh_private_key_fil
 manifestpath() = joinpath(homedir(), ".azmanagers")
 manifestfile() = joinpath(manifestpath(), "manifest.json")
 
+include("placement.jl")
+
 """
     AzManagers.write_manifest(;resourcegroup="", subscriptionid="", ssh_user="", ssh_public_key_file="~/.ssh/azmanagers_rsa.pub", ssh_private_key_file="~/.ssh/azmanagers_rsa")
 
@@ -3483,7 +3485,10 @@ function Base.kill(job::DetachedJob)
         "http://$(job.vm["ip"]):$(job.vm["port"])/cofii/detached/job/$(job.id)/kill")
 end
 
-export AzManager, DetachedJob, addproc, machine_preempt_channel_future, nphysical_cores, nworkers_provisioned, preempted, rmproc, scalesets, status, variablebundle, variablebundle!, vm, @detach, @detachat
+export AzManager, DetachedJob, MachineTopology, NumaTopology, SocketTopology,
+    WorkerPlacement, addproc, machine_preempt_channel_future, nphysical_cores,
+    nworkers_provisioned, plan_worker_placements, preempted, rmproc, scalesets,
+    status, variablebundle, variablebundle!, vm, @detach, @detachat
 
 if !isdefined(Base, :get_extension)
     include("../ext/MPIExt.jl")

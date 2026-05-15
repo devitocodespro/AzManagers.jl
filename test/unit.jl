@@ -34,6 +34,19 @@ end
     @test AzManagers.azure_compute_usages_url("sub", "eastus") == expected_url
 end
 
+@testset "unit: Azure API helpers" begin
+    response = HTTP.Response(
+        429,
+        ["x-ms-ratelimit-remaining-resource" => "quota"],
+        "")
+    error = HTTP.StatusError(429, "GET", "/target", response)
+
+    @test AzManagers.isretryable(error)
+    @test AzManagers.status(error) == 429
+    @test AzManagers.remaining_resource(response) == "quota"
+    @test !AzManagers.isretryable(ArgumentError("no retry"))
+end
+
 @testset "unit: automatic worker placement" begin
     topology = synthetic_topology()
 

@@ -661,7 +661,8 @@ method or a string corresponding to a template stored in `~/.azmanagers/template
 * `session=AzSession(;lazy=true)` The Azure session used for authentication.
 * `group="cbox"` The name of the Azure scale set.  If the scale set does not yet exist, it will be created.
 * `overprovision=true` Use Azure scle-set overprovisioning?
-* `ppi=1` The number of Julia processes to start per Azure scale set instance.
+* `worker_per_vm=1` The number of Julia workers to start per Azure scale set instance.
+* `ppi=1` Deprecated compatibility name for `worker_per_vm`.
 * `julia_num_threads="\$(Threads.nthreads(),\$(Threads.nthreads(:interactive))"` set the number of julia threads for the detached process.[2]
 * `omp_num_threads=get(ENV, "OMP_NUM_THREADS", 1)` set the number of OpenMP threads to run on each worker
 * `exename="\$(Sys.BINDIR)/julia"` name of the julia executable.

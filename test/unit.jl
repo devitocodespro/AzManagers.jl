@@ -155,7 +155,7 @@ end
 
 @testset "unit: detached wait error response" begin
     try
-        AzManagers.DETACHED_JOBS["unit"] = Dict(
+        AzManagers.DETACHED_JOBS["unit"] = Dict{String,Any}(
             "process" => "not-a-process",
             "codefile" => "unit-code.jl",
             "code" => "error(\"boom\")")

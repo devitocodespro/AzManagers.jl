@@ -45,53 +45,72 @@ AZURE RESOURCES YOU MUST HAVE
      on the resource group, OR a managed identity if you're running on Azure.
 
 ================================================================================
-ENV VARS REQUIRED
+CONFIGURATION
 ================================================================================
 
-  SUBSCRIPTION_ID  — Azure subscription GUID
-  RESOURCE_GROUP   — resource group name for scale sets
-  TENANT_ID        — AAD tenant GUID
-  CLIENT_ID        — service principal app id
-  CLIENT_SECRET    — service principal secret
-  VNET_NAME        — VNet hosting the worker subnet
-  SUBNET_NAME      — subnet for worker NICs
-  GALLERY_NAME     — shared image gallery name
-  IMAGE_NAME       — image definition name inside the gallery
-  LOCATION         — e.g. "southcentralus" (default if unset)
-  SKU_NAME         — VM SKU for the scale set, e.g. "Standard_D4s_v5"
-                     (a single-NUMA SKU is fine for the basic smoke; pick a
-                     multi-NUMA SKU like Standard_HB176rs_v4 for placement
-                     verification)
-  SSH_USER         — admin user baked into the image (typically "cvx")
+Settings come from a TOML file (preferred) with optional env-var overrides.
 
-ENV VARS THAT GATE EACH SCENARIO
+  1. Generate a template config (writes to ~/.azmanagers/smoketest.toml):
 
-  SMOKE_BASIC=1           — provision N=1 VM, ppi=1, verify connectivity
-  SMOKE_PLACEMENT=1       — provision N=1 VM, worker_per_vm=2, verify cpu_set /
-                            numa_node / socket / taskset on each worker
-  SMOKE_MPI_NESTED=1      — provision N=1 VM, worker_per_vm=2,
-                            mpi_ranks_per_worker=2 → 4 ranks total via two
-                            parallel mpirun groups
-  SMOKE_WORKER_PER_VM     — integer override for placement test (default 2)
-  SMOKE_MPI_RANKS         — integer override for MPI ranks per worker (default 2)
-  SMOKE_KEEP=1            — skip rmprocs at the end (so you can ssh in and poke
-                            around; you'll need to delete the scale set yourself)
+         julia --project=. demo/smoketest_addprocs.jl --init
+
+  2. Open ~/.azmanagers/smoketest.toml in your editor and fill in the Azure
+     resource names + service-principal secrets. Permissions are set to 0600
+     since the file holds CLIENT_SECRET.
+
+  3. Re-run, optionally pointing at a different config file:
+
+         julia --project=. demo/smoketest_addprocs.jl
+         julia --project=. demo/smoketest_addprocs.jl path/to/other.toml
+
+TOML schema (all fields required unless marked optional):
+
+  [azure]
+  subscription_id = "..."
+  resource_group  = "..."
+  tenant_id       = "..."
+  client_id       = "..."
+  client_secret   = "..."
+  vnet            = "..."
+  subnet          = "..."
+  gallery         = "..."
+  image_name      = "..."
+  location        = "southcentralus"   # optional
+  sku_name        = "Standard_D4s_v5"  # optional
+  ssh_user        = "cvx"              # optional
+
+  [scenarios]
+  basic        = true     # n=1, ppi=1, smoke connectivity
+  placement    = true     # n=1, worker_per_vm=2, verify cpu_set/numa/socket
+  mpi_nested   = false    # n=1, worker_per_vm=2, mpi_ranks_per_worker=2
+  worker_per_vm = 2       # optional override for placement + mpi_nested
+  mpi_ranks_per_worker = 2  # optional override for mpi_nested
+  mpi_flags    = ""       # optional extra mpirun flags
+  keep         = false    # skip rmprocs/rmgroup at the end
+
+Any TOML setting can be overridden at the command line:
+
+  AZURE_SUBSCRIPTION_ID=...  SCENARIOS_BASIC=1  julia --project=. demo/smoketest_addprocs.jl
+
+(env keys are upper-snake of section + field, joined with underscore).
 
 ================================================================================
 RUN IT
 ================================================================================
 
   cd ~/.julia/dev/AzManagers
+  julia --project=. demo/smoketest_addprocs.jl --init    # one-time setup
+  $EDITOR ~/.azmanagers/smoketest.toml
   julia --project=. demo/smoketest_addprocs.jl
 
 You'll see logs like:
 
   [ Info: writing templates for sku=Standard_HB176rs_v4
-  [ Info: addprocs(smoke; n=1, worker_per_vm=2) ...
+  [ Info: addprocs placement: group=smoke-place-abcd ...
   [ Info: worker 2: cpu_set=0-87 numa_node=0 socket=0 pinning_backend=numactl
   [ Info: worker 3: cpu_set=88-175 numa_node=1 socket=0 pinning_backend=numactl
-  [ Info: taskset -pc 12345: pid 12345's current affinity list: 0-87
-  [ Info: rmprocs done
+  [ Info: taskset for pid 2 expected=0-87 got=pid 12345's current affinity list: 0-87
+  [ Info: teardown complete for scale set smoke-place-abcd
 
 ================================================================================
 HOW TO CLEAN UP IF SOMETHING WEDGES
@@ -102,33 +121,96 @@ HOW TO CLEAN UP IF SOMETHING WEDGES
 
 =#
 
-using Distributed, AzManagers, AzSessions, Random, Test, HTTP, JSON
+using Distributed, AzManagers, AzSessions, Random, Test, HTTP, JSON, TOML
 
-const TEMPLATE_NAME = "smoke" * randstring('a':'z', 4)
+const TEMPLATE_NAME       = "smoke" * randstring('a':'z', 4)
+const DEFAULT_CONFIG_PATH = joinpath(homedir(), ".azmanagers", "smoketest.toml")
 
-function _env(name; default = nothing)
-    value = get(ENV, name, default)
-    value === nothing && error("missing required env var: $name")
-    value
+const TEMPLATE_TOML = """
+[azure]
+subscription_id = "REPLACE-ME"
+resource_group  = "REPLACE-ME"
+tenant_id       = "REPLACE-ME"
+client_id       = "REPLACE-ME"
+client_secret   = "REPLACE-ME"
+vnet            = "REPLACE-ME"
+subnet          = "REPLACE-ME"
+gallery         = "REPLACE-ME"
+image_name      = "REPLACE-ME"
+location        = "southcentralus"
+sku_name        = "Standard_D4s_v5"
+ssh_user        = "cvx"
+
+[scenarios]
+basic                 = true
+placement             = false
+mpi_nested            = false
+worker_per_vm         = 2
+mpi_ranks_per_worker  = 2
+mpi_flags             = ""
+keep                  = false
+"""
+
+function init_config(path)
+    if isfile(path)
+        @info "config already exists at $path; not overwriting"
+        return
+    end
+    mkpath(dirname(path))
+    write(path, TEMPLATE_TOML)
+    try
+        chmod(path, 0o600)
+    catch
+    end
+    @info "wrote template config to $path; edit it and rerun"
 end
 
-function _bool(name)
-    get(ENV, name, "0") in ("1", "true", "TRUE", "yes")
+function load_config(path)
+    isfile(path) ||
+        error("config file $path does not exist; run with --init to create a template")
+    TOML.parsefile(path)
 end
 
-function build_smoke_templates()
-    subscriptionid = _env("SUBSCRIPTION_ID")
-    resourcegroup  = _env("RESOURCE_GROUP")
-    tenant_id      = _env("TENANT_ID")
-    client_id      = _env("CLIENT_ID")
-    client_secret  = _env("CLIENT_SECRET")
-    vnet           = _env("VNET_NAME")
-    subnet         = _env("SUBNET_NAME")
-    gallery        = _env("GALLERY_NAME")
-    imagename      = _env("IMAGE_NAME")
-    location       = _env("LOCATION";  default = "southcentralus")
-    sku            = _env("SKU_NAME";  default = "Standard_D4s_v5")
-    ssh_user       = _env("SSH_USER";  default = "cvx")
+function get_field(cfg, section, field; default = nothing, required = true)
+    env_key = uppercase(string(section, "_", field))
+    if haskey(ENV, env_key)
+        return ENV[env_key]
+    end
+    section_table = get(cfg, string(section), Dict())
+    if haskey(section_table, string(field))
+        return section_table[string(field)]
+    end
+    default !== nothing && return default
+    required && error("missing config field [$section].$field (or env var $env_key)")
+    nothing
+end
+
+function get_bool(cfg, section, field; default = false)
+    value = get_field(cfg, section, field; default = default, required = false)
+    value isa Bool && return value
+    value isa AbstractString && return lowercase(value) in ("1", "true", "yes")
+    Bool(value)
+end
+
+function get_int(cfg, section, field; default)
+    value = get_field(cfg, section, field; default = default, required = false)
+    value isa Integer && return Int(value)
+    parse(Int, string(value))
+end
+
+function build_smoke_templates(cfg)
+    subscriptionid = get_field(cfg, :azure, :subscription_id)
+    resourcegroup  = get_field(cfg, :azure, :resource_group)
+    tenant_id      = get_field(cfg, :azure, :tenant_id)
+    client_id      = get_field(cfg, :azure, :client_id)
+    client_secret  = get_field(cfg, :azure, :client_secret)
+    vnet           = get_field(cfg, :azure, :vnet)
+    subnet         = get_field(cfg, :azure, :subnet)
+    gallery        = get_field(cfg, :azure, :gallery)
+    imagename      = get_field(cfg, :azure, :image_name)
+    location       = get_field(cfg, :azure, :location; default = "southcentralus", required = false)
+    sku            = get_field(cfg, :azure, :sku_name; default = "Standard_D4s_v5", required = false)
+    ssh_user       = get_field(cfg, :azure, :ssh_user; default = "cvx", required = false)
 
     @info "writing templates for sku=$sku location=$location"
 
@@ -198,9 +280,9 @@ function assert_taskset_matches(placements)
     end
 end
 
-function teardown(group)
-    if _bool("SMOKE_KEEP")
-        @warn "SMOKE_KEEP=1; leaving workers + scale set '$group' running"
+function teardown(cfg, group)
+    if get_bool(cfg, :scenarios, :keep)
+        @warn "scenarios.keep=true; leaving workers + scale set '$group' running"
         return
     end
     isempty(workers()) || rmprocs(workers())
@@ -212,7 +294,7 @@ function teardown(group)
     @info "teardown complete for scale set $group"
 end
 
-function smoke_basic(session)
+function smoke_basic(cfg, session)
     group = "smoke-basic-" * randstring('a':'z', 4)
     @info "addprocs basic: group=$group n=1 ppi=1"
     addprocs(AzManager(), TEMPLATE_NAME, 1; waitfor = true, ppi = 1, group, session)
@@ -221,13 +303,13 @@ function smoke_basic(session)
         hostname = remotecall_fetch(gethostname, first(workers()))
         @info "basic worker hostname=$hostname"
     finally
-        teardown(group)
+        teardown(cfg, group)
     end
 end
 
-function smoke_placement(session)
-    group = "smoke-place-" * randstring('a':'z', 4)
-    worker_per_vm = parse(Int, get(ENV, "SMOKE_WORKER_PER_VM", "2"))
+function smoke_placement(cfg, session)
+    group         = "smoke-place-" * randstring('a':'z', 4)
+    worker_per_vm = get_int(cfg, :scenarios, :worker_per_vm; default = 2)
     @info "addprocs placement: group=$group n=1 worker_per_vm=$worker_per_vm"
     addprocs(AzManager(), TEMPLATE_NAME, 1;
         waitfor       = true,
@@ -242,19 +324,19 @@ function smoke_placement(session)
         @assert length(unique(cpu_sets)) == worker_per_vm "cpu_sets are not disjoint: $cpu_sets"
         assert_taskset_matches(placements)
     finally
-        teardown(group)
+        teardown(cfg, group)
     end
 end
 
-function smoke_mpi_nested(session)
+function smoke_mpi_nested(cfg, session)
     group                 = "smoke-mpi-" * randstring('a':'z', 4)
-    worker_per_vm         = parse(Int, get(ENV, "SMOKE_WORKER_PER_VM", "2"))
-    mpi_ranks_per_worker  = parse(Int, get(ENV, "SMOKE_MPI_RANKS", "2"))
+    worker_per_vm         = get_int(cfg, :scenarios, :worker_per_vm; default = 2)
+    mpi_ranks_per_worker  = get_int(cfg, :scenarios, :mpi_ranks_per_worker; default = 2)
+    # mpi_flags defaults to "" so the auto-emitted `--bind-to cpu-list:ordered`
+    # is not overridden. Set scenarios.mpi_flags in the TOML if your image
+    # needs extra mpirun flags.
+    mpi_flags = string(get_field(cfg, :scenarios, :mpi_flags; default = "", required = false))
     @info "addprocs MPI nested: group=$group worker_per_vm=$worker_per_vm mpi_ranks_per_worker=$mpi_ranks_per_worker"
-    # `mpi_flags=""` so the auto-emitted `--bind-to cpu-list:ordered` is not
-    # overridden. If your image needs explicit --map-by or extra flags, set
-    # SMOKE_MPI_FLAGS and they will be appended verbatim.
-    mpi_flags = get(ENV, "SMOKE_MPI_FLAGS", "")
     addprocs(AzManager(), TEMPLATE_NAME, 1;
         waitfor              = true,
         worker_per_vm        = worker_per_vm,
@@ -276,18 +358,28 @@ function smoke_mpi_nested(session)
         end
         dump_worker_placements()
     finally
-        teardown(group)
+        teardown(cfg, group)
     end
 end
 
 function main()
-    session = build_smoke_templates()
+    if !isempty(ARGS) && ARGS[1] == "--init"
+        path = length(ARGS) >= 2 ? ARGS[2] : DEFAULT_CONFIG_PATH
+        init_config(path)
+        return
+    end
+
+    config_path = isempty(ARGS) ? DEFAULT_CONFIG_PATH : ARGS[1]
+    cfg = load_config(config_path)
+    @info "loaded config from $config_path"
+
+    session = build_smoke_templates(cfg)
+
     any_run = false
-    if _bool("SMOKE_BASIC");      any_run = true; smoke_basic(session); end
-    if _bool("SMOKE_PLACEMENT");  any_run = true; smoke_placement(session); end
-    if _bool("SMOKE_MPI_NESTED"); any_run = true; smoke_mpi_nested(session); end
-    any_run ||
-        @warn "no SMOKE_* gate enabled; set SMOKE_BASIC=1, SMOKE_PLACEMENT=1, or SMOKE_MPI_NESTED=1"
+    if get_bool(cfg, :scenarios, :basic);      any_run = true; smoke_basic(cfg, session); end
+    if get_bool(cfg, :scenarios, :placement);  any_run = true; smoke_placement(cfg, session); end
+    if get_bool(cfg, :scenarios, :mpi_nested); any_run = true; smoke_mpi_nested(cfg, session); end
+    any_run || @warn "no scenario enabled in $config_path; flip [scenarios] entries to true"
 end
 
 main()

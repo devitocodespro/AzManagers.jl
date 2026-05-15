@@ -158,6 +158,36 @@ end
         [collect(0:3), collect(4:7)]
 end
 
+@testset "unit: numactl --hardware parsing" begin
+    sample = """
+    available: 2 nodes (0-1)
+    node 0 cpus: 0 1 2 3
+    node 0 size: 16374 MB
+    node 0 free: 256 MB
+    node 1 cpus: 4 5 6 7
+    node 1 size: 16384 MB
+    node 1 free: 1024 MB
+    node distances:
+    node   0   1
+      0:  10  21
+      1:  21  10
+    """
+    topology = AzManagers.parse_numactl_topology(sample)
+    @test topology.physical_cores == 8
+    @test topology.logical_cpus == collect(0:7)
+    @test getfield.(topology.numa_nodes, :id) == [0, 1]
+    @test getfield.(topology.numa_nodes, :cpu_set) ==
+        [collect(0:3), collect(4:7)]
+    @test getfield.(topology.sockets, :id) == [0, 1]
+    @test !topology.hyperthreading
+
+    @test_throws ArgumentError AzManagers.parse_numactl_topology("available: 0\n")
+end
+
+@testset "unit: Hwloc topology stub without extension" begin
+    @test_throws ErrorException AzManagers._hwloc_topology()
+end
+
 @testset "unit: worker_per_vm alias" begin
     @test AzManagers.resolve_worker_per_vm(4, nothing) == 4
     @test AzManagers.resolve_worker_per_vm(1, 4) == 4

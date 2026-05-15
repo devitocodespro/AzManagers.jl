@@ -171,10 +171,49 @@ function topology_domains(
     nodes
 end
 
+function parse_numactl_topology(text::AbstractString)
+    node_cpus = Vector{Pair{Int,Vector{Int}}}()
+    for raw_line in split(text, '\n')
+        line = strip(raw_line)
+        match_result = match(r"^node ([0-9]+) cpus:\s*(.*)$", line)
+        match_result === nothing && continue
+        node_id = parse(Int, match_result.captures[1])
+        cpu_text = strip(String(match_result.captures[2]))
+        cpus = isempty(cpu_text) ? Int[] :
+            sort(unique(parse.(Int, split(cpu_text))))
+        push!(node_cpus, node_id => cpus)
+    end
+
+    isempty(node_cpus) &&
+        throw(ArgumentError("no NUMA node cpus reported by numactl --hardware"))
+
+    sort!(node_cpus; by=first)
+    logical_cpus = sorted_unique_cpus([cpus for (_, cpus) in node_cpus])
+    physical_cores = length(logical_cpus)
+
+    sockets = [SocketTopology(id, cpus) for (id, cpus) in node_cpus]
+    numa_nodes = [NumaTopology(id, cpus, id) for (id, cpus) in node_cpus]
+
+    MachineTopology(physical_cores, logical_cpus, sockets, numa_nodes, false)
+end
+
 function detect_machine_topology()
     try
+        return _hwloc_topology()
+    catch err
+        @debug "Hwloc topology probe unavailable" err
+    end
+
+    try
         return parse_lscpu_json_topology(read(`lscpu --json`, String))
-    catch
+    catch err
+        @debug "lscpu --json topology probe failed" err
+    end
+
+    try
+        return parse_numactl_topology(read(`numactl --hardware`, String))
+    catch err
+        @debug "numactl --hardware topology probe failed" err
     end
 
     output = try
@@ -184,6 +223,8 @@ function detect_machine_topology()
     end
     parse_lscpu_topology(output)
 end
+
+_hwloc_topology() = throw(ErrorException("Hwloc.jl extension not loaded"))
 
 function resolve_worker_per_vm(ppi::Int, worker_per_vm)
     if worker_per_vm === nothing

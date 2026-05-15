@@ -95,6 +95,9 @@ end
     @test metadata["worker_per_vm"] == 4
     @test metadata["cpu_set"] == "4-7"
     @test metadata["pinning_backend"] == "numactl"
+    @test AzManagers.placement_userdata(metadata) == metadata
+    @test AzManagers.numactl_prefix(placement) ==
+        "numactl --physcpubind=4-7 --membind=1 "
 end
 
 @testset "unit: shell environment rendering" begin
@@ -104,6 +107,11 @@ end
     @test contains(rendered, "export FOO='bar baz'")
     @test contains(rendered, "export QUOTE='a'\"'\"'b'")
     @test_throws ArgumentError AzManagers.build_envstring(Dict("1BAD" => "value"))
+
+    placement = plan_worker_placements(synthetic_topology(), 4)[1]
+    placement_exports = AzManagers.placement_export_string(placement)
+    @test contains(placement_exports, "export JULIA_NUM_THREADS='4,1'")
+    @test contains(placement_exports, "export OMP_PROC_BIND='close'")
 end
 
 @testset "unit: VM template resource IDs" begin

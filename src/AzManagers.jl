@@ -1056,6 +1056,18 @@ function nworkers_provisioned(service=false)
     max(0, n - pending_down_count)
 end
 
+function worker_placement(pid::Int)
+    wrkr = Distributed.map_pid_wrkr[pid]
+    if isdefined(wrkr, :config) && isdefined(wrkr.config, :userdata)
+        return placement_userdata(wrkr.config.userdata)
+    end
+    Dict()
+end
+
+function worker_placements()
+    Dict(pid => worker_placement(pid) for pid in workers())
+end
+
 """
     rmgroup(groupname[; kwargs...])
 
@@ -3500,7 +3512,8 @@ end
 export AzManager, DetachedJob, MachineTopology, NumaTopology, SocketTopology,
     WorkerPlacement, addproc, machine_preempt_channel_future, nphysical_cores,
     nworkers_provisioned, plan_worker_placements, preempted, rmproc, scalesets,
-    status, variablebundle, variablebundle!, vm, @detach, @detachat
+    status, variablebundle, variablebundle!, vm, worker_placement,
+    worker_placements, @detach, @detachat
 
 if !isdefined(Base, :get_extension)
     include("../ext/MPIExt.jl")

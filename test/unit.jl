@@ -27,6 +27,13 @@ function synthetic_lscpu()
     """
 end
 
+function uneven_topology()
+    sockets = [SocketTopology(0, collect(0:9))]
+    numa_nodes = [NumaTopology(0, collect(0:9), 0)]
+
+    MachineTopology(10, collect(0:9), sockets, numa_nodes, false)
+end
+
 @testset "unit: Azure URL helpers" begin
     expected_url = "https://management.azure.com/subscriptions/sub/" *
         "providers/Microsoft.Compute/locations/eastus/usages?api-version=2019-07-01"
@@ -67,6 +74,11 @@ end
     @test length(split_workers) == 8
     @test getfield.(split_workers, :cpu_set)[1] == [0, 1]
     @test getfield.(split_workers, :cpu_set)[end] == [14, 15]
+
+    @test_logs (:warn, "CPU cores do not divide evenly across workers") begin
+        uneven_workers = plan_worker_placements(uneven_topology(), 4)
+        @test length.(getfield.(uneven_workers, :cpu_set)) == [3, 3, 2, 2]
+    end
 
     @test_throws ArgumentError plan_worker_placements(topology, 17)
 end

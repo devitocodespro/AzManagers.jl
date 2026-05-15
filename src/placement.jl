@@ -281,6 +281,9 @@ function plan_worker_placements(topology::MachineTopology, worker_per_vm::Int)
         sorted_unique_cpus([topology.logical_cpus])
     end
     chunks = split_evenly(cpu_set, worker_per_vm)
+    if rem(length(cpu_set), worker_per_vm) != 0
+        @warn "CPU cores do not divide evenly across workers" cpu_count=length(cpu_set) worker_per_vm
+    end
 
     [
         placement_from_cpu_set(index, topology, chunk)

@@ -738,6 +738,7 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
         use_lvm = false)
     n_current_workers = nprocs() == 1 ? 0 : nworkers()
     worker_count_per_vm = resolve_worker_per_vm(ppi, worker_per_vm)
+    validate_worker_per_vm_options(worker_count_per_vm, mpi_ranks_per_worker)
 
     (subscriptionid == "" || resourcegroup == "" || user == "") && load_manifest()
     subscriptionid == "" && (subscriptionid = get(template, "subscriptionid", _manifest["subscriptionid"]))

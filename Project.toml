@@ -25,9 +25,11 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [weakdeps]
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 
 [extensions]
 MPIExt = "MPI"
+ThreadPinningExt = "ThreadPinning"
 
 [compat]
 AzSessions = "2"
@@ -37,8 +39,10 @@ JSON = "0.21, 1"
 JWTs = "0.3"
 LibCURL = "0.6, 1"
 MPI = "0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20"
+ThreadPinning = "0.7, 1"
 TOML = "1"
 julia = "^1.4"
 
 [extras]
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"

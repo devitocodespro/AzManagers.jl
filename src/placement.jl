@@ -400,13 +400,25 @@ function placement_export_string(placement::WorkerPlacement)
     build_envstring(placement_environment(placement))
 end
 
+"""
+    pin_julia_threads(cpu_set)
+
+Best-effort pin of the current process' Julia threads to the given physical
+CPU IDs. Returns `true` when an integration successfully pinned threads, and
+`false` otherwise.
+
+The base package only provides this no-op fallback so that callers can rely
+on `numactl` for OS-level pinning. Loading `ThreadPinning.jl` activates the
+`ThreadPinningExt` package extension, which replaces this method via
+`Base.invokelatest` dispatch on `_pin_julia_threads_impl`.
+"""
 function pin_julia_threads(cpu_set::Vector{Int})
     try
-        @eval using ThreadPinning
-        @eval ThreadPinning.pinthreads($cpu_set)
-        true
+        Base.invokelatest(_pin_julia_threads_impl, cpu_set)
     catch err
-        @debug "ThreadPinning.jl unavailable; relying on numactl pinning" err
+        @debug "thread pinning unavailable; relying on numactl pinning" err
         false
     end
 end
+
+_pin_julia_threads_impl(::Any) = false

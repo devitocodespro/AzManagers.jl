@@ -438,6 +438,16 @@ function nworkers_provisioned(service=false)
     max(0, n - pending_down_count)
 end
 
+"""
+    worker_placement(pid)
+
+Return the CPU/NUMA placement metadata recorded for worker `pid`. Keys are the
+ones produced by `worker_per_vm` placement: `localid`, `worker_per_vm`,
+`physical_cores`, `julia_threads`, `julia_interactive_threads`, `omp_threads`,
+`cpu_set` (e.g. `"0-43"`), `numa_node`, `socket`, and `pinning_backend`.
+Returns an empty `Dict` when no placement was recorded (e.g. the worker was
+launched outside `addprocs(...; worker_per_vm=...)`).
+"""
 function worker_placement(pid::Int)
     wrkr = Distributed.map_pid_wrkr[pid]
     if isdefined(wrkr, :config) && isdefined(wrkr.config, :userdata)
@@ -446,6 +456,12 @@ function worker_placement(pid::Int)
     Dict()
 end
 
+"""
+    worker_placements()
+
+Return a `Dict{Int,Dict}` of placement metadata for every active worker. See
+[`worker_placement`](@ref) for the per-worker keys.
+"""
 function worker_placements()
     Dict(pid => worker_placement(pid) for pid in workers())
 end

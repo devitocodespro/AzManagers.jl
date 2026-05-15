@@ -17,7 +17,12 @@ function logerror(e, loglevel=Logging.Info)
     close(io)
 end
 
-const _manifest = Dict("resourcegroup"=>"", "ssh_user"=>"", "ssh_private_key_file"=>"", "ssh_public_key_file"=>"", "subscriptionid"=>"")
+const _manifest = Dict{String,String}(
+    "resourcegroup" => "",
+    "ssh_user" => "",
+    "ssh_private_key_file" => "",
+    "ssh_public_key_file" => "",
+    "subscriptionid" => "")
 
 manifestpath() = joinpath(homedir(), ".azmanagers")
 manifestfile() = joinpath(manifestpath(), "manifest.json")
@@ -2551,8 +2556,17 @@ end
 # detached service and REST API
 #
 const DETACHED_ROUTER = HTTP.Router()
-const DETACHED_JOBS = Dict()
-const DETACHED_VM = Ref(Dict())
+
+mutable struct DetachedServiceState
+    jobs::Dict{String,Dict{String,Any}}
+    vm::Base.RefValue{Dict{String,String}}
+end
+
+const DETACHED_STATE = DetachedServiceState(
+    Dict{String,Dict{String,Any}}(),
+    Ref(Dict{String,String}()))
+const DETACHED_JOBS = DETACHED_STATE.jobs
+const DETACHED_VM = DETACHED_STATE.vm
 
 let DETACHED_ID::Int = 1
     global detached_nextid
@@ -3286,7 +3300,7 @@ function detached_service_wait(vm, custom_environment)
     write(stdout, "\n")
 end
 
-const VARIABLE_BUNDLE = Dict()
+const VARIABLE_BUNDLE = Dict{Symbol,Any}()
 function variablebundle!(bundle::Dict)
     for (key,value) in bundle
         AzManagers.VARIABLE_BUNDLE[Symbol(key)] = value

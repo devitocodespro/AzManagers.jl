@@ -1,23 +1,28 @@
-using AzManagers, Distributed, Test
+using AzManagers, AzSessions, Distributed, Test
 
 if get(ENV, "AZMANAGERS_RUN_NUMA_INTEGRATION", "false") == "true"
     @testset "integration: NUMA worker placement" begin
         template = get(ENV, "AZMANAGERS_NUMA_TEMPLATE", "")
         isempty(template) && error("AZMANAGERS_NUMA_TEMPLATE must be set")
 
-        worker_per_vm = parse(Int, get(ENV, "AZMANAGERS_NUMA_WORKER_PER_VM", "2"))
-        addprocs(template, 1; waitfor=true, worker_per_vm)
+        # Service-principal session - the default AzSession() falls back to
+        # device-code flow, which on a headless CI runner sits at the prompt
+        # for 15 minutes and then errors expired_token.
+        session = AzSession(; protocal=AzClientCredentials)
+
+        ppi = parse(Int, get(ENV, "AZMANAGERS_NUMA_PPI", "2"))
+        addprocs(template, 1; waitfor=true, ppi, session=session)
 
         try
             placements = worker_placements()
-            @test length(placements) == worker_per_vm
+            @test length(placements) == ppi
 
             cpu_sets = get.(values(placements), "cpu_set", "")
             numa_nodes = get.(values(placements), "numa_node", nothing)
             sockets = get.(values(placements), "socket", nothing)
 
             @test all(!isempty, cpu_sets)
-            @test length(unique(cpu_sets)) == worker_per_vm
+            @test length(unique(cpu_sets)) == ppi
             @test all(node -> node !== nothing, numa_nodes)
             @test all(socket -> socket !== nothing, sockets)
 

@@ -184,20 +184,20 @@ end
     @test_throws ArgumentError AzManagers.parse_numactl_topology("available: 0\n")
 end
 
-@testset "unit: Hwloc topology stub without extension" begin
-    @test_throws MethodError AzManagers._hwloc_topology()
+@testset "unit: Hwloc topology probe" begin
+    topology = AzManagers.hwloc_topology()
+    @test topology isa AzManagers.MachineTopology
+    @test topology.physical_cores >= 1
+    @test !isempty(topology.logical_cpus)
+    @test !isempty(topology.sockets)
 end
 
-@testset "unit: worker_per_vm alias" begin
-    @test AzManagers.resolve_worker_per_vm(4, nothing) == 4
-    @test AzManagers.resolve_worker_per_vm(1, 4) == 4
-    @test AzManagers.resolve_worker_per_vm(4, 4) == 4
-    @test_throws ArgumentError AzManagers.resolve_worker_per_vm(2, 4)
-    @test isnothing(AzManagers.validate_worker_per_vm_options(4, 0))
-    @test isnothing(AzManagers.validate_worker_per_vm_options(1, 2))
-    @test isnothing(AzManagers.validate_worker_per_vm_options(2, 1))
-    @test_throws ArgumentError AzManagers.validate_worker_per_vm_options(0, 0)
-    @test_throws ArgumentError AzManagers.validate_worker_per_vm_options(1, -1)
+@testset "unit: ppi option validation" begin
+    @test isnothing(AzManagers.validate_ppi_options(4, 0))
+    @test isnothing(AzManagers.validate_ppi_options(1, 2))
+    @test isnothing(AzManagers.validate_ppi_options(2, 1))
+    @test_throws ArgumentError AzManagers.validate_ppi_options(0, 0)
+    @test_throws ArgumentError AzManagers.validate_ppi_options(1, -1)
 end
 
 @testset "unit: MPI rank placement planning" begin
@@ -292,7 +292,7 @@ end
     @test env["OMP_PLACES"] == "cores"
 
     metadata = AzManagers.worker_placement_metadata(topology, placement, 4)
-    @test metadata["worker_per_vm"] == 4
+    @test metadata["ppi"] == 4
     @test metadata["cpu_set"] == "4-7"
     @test metadata["pinning_backend"] == "numactl"
     thread_metadata = AzManagers.worker_placement_metadata(
@@ -426,9 +426,7 @@ end
     empty!(AzManagers.VARIABLE_BUNDLE_STATE.bundle)
 end
 
-@testset "unit: pin_julia_threads fallback without ThreadPinning" begin
-    @test AzManagers._pin_julia_threads_impl(Int[]) == false
-    @test AzManagers._pin_julia_threads_impl([0, 1]) == false
+@testset "unit: pin_julia_threads" begin
     @test AzManagers.pin_julia_threads(Int[]) == false
-    @test AzManagers.pin_julia_threads([0, 1, 2]) == false
+    @test AzManagers.pin_julia_threads([0]) isa Bool
 end

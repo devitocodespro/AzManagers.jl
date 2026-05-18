@@ -1,6 +1,6 @@
 module AzManagers
 
-using AzSessions, Base64, CodecZlib, Dates, Distributed, HTTP, JSON, JWTs, LibCURL, LibGit2, Logging, Pkg, Printf, Random, Serialization, Sockets, TOML
+using AzSessions, Base64, CodecZlib, Dates, Distributed, HTTP, Hwloc, JSON, JWTs, LibCURL, LibGit2, Logging, Pkg, Printf, Random, Serialization, Sockets, ThreadPinning, TOML
 
 function logerror(e, loglevel=Logging.Info)
     io = IOBuffer()
@@ -115,11 +115,17 @@ function spinner(n_target_workers)
     while nprocs() == 1 || nworkers() != n_target_workers
         try
             elapsed_time = time() - starttime
-            if time() - tic > 10
+            # Refresh worker count and emit a real newline every 10 s. The
+            # \n acts as a checkpoint so CI log collectors (which split on
+            # \n, not \r) flush the spinner output instead of buffering it
+            # for the lifetime of the addprocs call.
+            checkpoint = time() - tic > 10
+            if checkpoint
                 _nworkers = nprocs() == 1 ? 0 : nworkers()
                 tic = time()
             end
-            write(stdout, spin(spincount, elapsed_time)*", $_nworkers/$n_target_workers up. $ws\r")
+            sep = checkpoint ? "\n" : "\r"
+            write(stdout, spin(spincount, elapsed_time)*", $_nworkers/$n_target_workers up. $ws$sep")
             flush(stdout)
             spincount = spincount == 4 ? 1 : spincount + 1
             yield()
@@ -140,7 +146,15 @@ function nthreads_filter(nthreads)
     nthreads_default = length(_nthreads) > 0 ? parse(Int, _nthreads[1]) : 1
     nthreads_interactive = length(_nthreads) > 1 ? parse(Int, _nthreads[2]) : 0
 
-    nthreads_interactive > 0 ? string("$nthreads_default,$nthreads_interactive") : string(nthreads_default)
+    # On Julia 1.9+ keep the explicit "N,I" form even when I==0. Collapsing
+    # to bare "N" is only safe for pre-1.9 (which has no interactive pool):
+    # Julia 1.11+ silently auto-adds an interactive thread when -t is a
+    # bare N, which would override an explicit request for zero interactive
+    # threads.
+    if VERSION >= v"1.9"
+        return "$nthreads_default,$nthreads_interactive"
+    end
+    nthreads_interactive > 0 ? "$nthreads_default,$nthreads_interactive" : string(nthreads_default)
 end
 
 """
@@ -161,8 +175,7 @@ method or a string corresponding to a template stored in `~/.azmanagers/template
 * `session=AzSession(;lazy=true)` The Azure session used for authentication.
 * `group="cbox"` The name of the Azure scale set.  If the scale set does not yet exist, it will be created.
 * `overprovision=true` Use Azure scle-set overprovisioning?
-* `worker_per_vm=1` The number of Julia workers to start per Azure scale set instance.
-* `ppi=1` Deprecated compatibility name for `worker_per_vm`.
+* `ppi=1` Procs-per-instance: the number of Julia workers to start per Azure scale set instance.
 * `julia_num_threads="\$(Threads.nthreads(),\$(Threads.nthreads(:interactive))"` set the number of julia threads for the detached process.[2]
 * `omp_num_threads=get(ENV, "OMP_NUM_THREADS", 1)` set the number of OpenMP threads to run on each worker
 * `exename="\$(Sys.BINDIR)/julia"` name of the julia executable.
@@ -197,7 +210,7 @@ used on the Julia workers.  This feature makes use of package extensions, meanin
 that `using MPI` is somewhere in your calling script.
 [5] This may result in a re-boot of the VMs
 """
-function Distributed.addprocs(::AzManager, template::Dict, n::Int;
+function Distributed.addprocs(::AzManager, template::AbstractDict, n::Int;
         subscriptionid = "",
         resourcegroup = "",
         sigimagename = "",
@@ -209,7 +222,6 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
         group = "cbox",
         overprovision = true,
         ppi = 1,
-        worker_per_vm = nothing,
         julia_num_threads = VERSION >= v"1.9" ? "$(Threads.nthreads()),$(Threads.nthreads(:interactive))" : string(Threads.nthreads()),
         omp_num_threads = parse(Int, get(ENV, "OMP_NUM_THREADS", "1")),
         exename = "$(Sys.BINDIR)/julia",
@@ -232,8 +244,7 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
         hyperthreading = nothing,
         use_lvm = false)
     n_current_workers = nprocs() == 1 ? 0 : nworkers()
-    worker_count_per_vm = resolve_worker_per_vm(ppi, worker_per_vm)
-    validate_worker_per_vm_options(worker_count_per_vm, mpi_ranks_per_worker)
+    validate_ppi_options(ppi, mpi_ranks_per_worker)
 
     (subscriptionid == "" || resourcegroup == "" || user == "") && load_manifest()
     subscriptionid == "" && (subscriptionid = get(template, "subscriptionid", _manifest["subscriptionid"]))
@@ -256,13 +267,13 @@ function Distributed.addprocs(::AzManager, template::Dict, n::Int;
 
     @info "Provisioning $n virtual machines in scale-set $group..."
     _scalesets[scaleset] = scaleset_create_or_update(manager, user, scaleset.subscriptionid, scaleset.resourcegroup, scaleset.scalesetname, sigimagename,
-        sigimageversion, imagename, osdisksize, nretry, template, n, worker_count_per_vm, mpi_ranks_per_worker, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig,
+        sigimageversion, imagename, osdisksize, nretry, template, n, ppi, mpi_ranks_per_worker, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig,
         hyperthreading, julia_num_threads, omp_num_threads, exename, exeflags, env, spot, maxprice, spot_base_regular_priority_count, spot_regular_percentage_above_base,
         verbose, customenv, overprovision, use_lvm)
 
     if waitfor
         @info "Initiating cluster..."
-        spinner_tsk = @async spinner(n_current_workers + n * worker_count_per_vm)
+        spinner_tsk = @async spinner(n_current_workers + n * ppi)
         wait(spinner_tsk)
     end
 
@@ -276,6 +287,31 @@ function Distributed.addprocs(mgr::AzManager, template::AbstractString, n::Int; 
     haskey(templates_scaleset, template) || error("scale-set template file does not contain a template with name: $template. See `AzManagers.save_template_scaleset`")
 
     addprocs(mgr, templates_scaleset[template], n; kwargs...)
+end
+
+"""
+    addprocs(template::AbstractString, n::Int; kwargs...)
+
+Convenience overload for the public docs' `addprocs("myscaleset", 5)`
+form: builds a fresh `AzManager()` and looks the template up by name in
+`~/.azmanagers/templates_scaleset.json`. Equivalent to
+`addprocs(AzManager(), template, n; kwargs...)`.
+"""
+function Distributed.addprocs(template::AbstractString, n::Int; kwargs...)
+    addprocs(AzManager(), template, n; kwargs...)
+end
+
+"""
+    addprocs(template::AbstractDict, n::Int; kwargs...)
+
+Convenience overload for an already-loaded template dict (e.g. the value
+read from `~/.azmanagers/templates_scaleset.json` via `JSON.parse`).
+Builds a fresh `AzManager()` and forwards. Accepts any `AbstractDict`
+(plain `Dict`, `JSON.Object`, etc.) so the same call site works regardless
+of which JSON parser was used.
+"""
+function Distributed.addprocs(template::AbstractDict, n::Int; kwargs...)
+    addprocs(AzManager(), template, n; kwargs...)
 end
 
 function Distributed.launch(manager::AzManager, params::Dict, launched::Array, c::Condition)
@@ -393,7 +429,17 @@ function Distributed.kill(manager::AzManager, id::Int, config::WorkerConfig)
     end
 
     try
-        remote_do(exit, id, 42)
+        # Bypass atexit hooks. `exit(42)` first runs `jl_atexit_hook`, which
+        # in turn waits on every registered atexit callback. On customenv
+        # workers an in-flight `Pkg.precompile()` task leaves a hook that
+        # never returns, so `exit(42)` deadlocks and the master's `rmprocs`
+        # blocks forever on the worker's TCP connection. Calling jl_exit
+        # directly terminates the process immediately. Safe here because
+        # the worker VM gets deleted by scaleset_pruning anyway; there's
+        # nothing to gracefully clean up on the worker side.
+        remote_do(id) do
+            ccall(:jl_exit, Cvoid, (Int32,), Int32(42))
+        end
     catch
     end
     @debug "kill, done remote_do"
@@ -442,11 +488,11 @@ end
     worker_placement(pid)
 
 Return the CPU/NUMA placement metadata recorded for worker `pid`. Keys are the
-ones produced by `worker_per_vm` placement: `localid`, `worker_per_vm`,
-`physical_cores`, `julia_threads`, `julia_interactive_threads`, `omp_threads`,
-`cpu_set` (e.g. `"0-43"`), `numa_node`, `socket`, and `pinning_backend`.
-Returns an empty `Dict` when no placement was recorded (e.g. the worker was
-launched outside `addprocs(...; worker_per_vm=...)`).
+ones produced by `ppi`-based placement: `localid`, `ppi`, `physical_cores`,
+`julia_threads`, `julia_interactive_threads`, `omp_threads`, `cpu_set`
+(e.g. `"0-43"`), `numa_node`, `socket`, and `pinning_backend`. Returns an
+empty `Dict` when no placement was recorded (e.g. the worker was launched
+outside `addprocs(...; ppi=...)`).
 """
 function worker_placement(pid::Int)
     wrkr = Distributed.map_pid_wrkr[pid]
@@ -547,22 +593,17 @@ function azure_worker_init(cookie, master_address, master_port, ppi, exeflags, m
         "mpi_size" => mpi_size,
         "physical_hostname" => azure_physical_name())
 
-    if mpi_size == 0 && ppi > 0
-        try
-            topology = detect_machine_topology()
-            placement = plan_worker_placements(topology, ppi)[1]
-            pinned = pin_julia_threads(placement.cpu_set)
-            backend = pinned ? "ThreadPinning" : "none"
-            merge!(userdata, worker_placement_metadata(
-                topology,
-                placement,
-                ppi;
-                pinning_backend = backend))
-        catch e
-            @debug "unable to apply initial worker placement"
-            logerror(e, Logging.Debug)
-        end
-    end
+    # Note: a previous version of this function ran detect_machine_topology
+    # / plan_worker_placements / pin_julia_threads here to attach placement
+    # metadata to the worker's userdata before the handshake completes. That
+    # turned out to be the source of "0/N up forever" hangs: any of those
+    # calls can block (Hwloc on a busy /sys, lscpu / numactl waiting on
+    # stuck child processes, ThreadPinning.pinthreads against the GC thread
+    # in newer Julia), and a `try`/`catch` cannot rescue a hang. The
+    # handshake must not depend on best-effort metadata collection.
+    # The multi-worker path (ppi > 1) already attaches placement metadata
+    # AFTER the worker is registered, in `launch_n_additional_processes`,
+    # so that path is unaffected.
 
     vm = Dict(
         "exeflags" => exeflags,
@@ -718,9 +759,9 @@ function Distributed.launch_n_additional_processes(manager::AzManager, frompid, 
         exeflags = something(fromconfig.exeflags, ``)
 
         placement_info = try
-            remotecall_fetch(frompid, cnt + 1) do worker_per_vm
+            remotecall_fetch(frompid, cnt + 1) do ppi
                 topology = AzManagers.detect_machine_topology()
-                placements = AzManagers.plan_worker_placements(topology, worker_per_vm)
+                placements = AzManagers.plan_worker_placements(topology, ppi)
                 use_numactl = Sys.which("numactl") !== nothing
                 topology, placements, use_numactl
             end
@@ -753,7 +794,7 @@ function Distributed.launch_n_additional_processes(manager::AzManager, frompid, 
                 launched_q;
                 topology,
                 placement,
-                worker_per_vm = cnt + 1)
+                ppi = cnt + 1)
         end
     end
 end
@@ -766,7 +807,7 @@ function add_launched_workers(
         launched_q;
         topology = nothing,
         placement = nothing,
-        worker_per_vm = nothing)
+        ppi = nothing)
     for (localid,address) in enumerate(new_addresses)
             (bind_addr, port) = address
 
@@ -784,10 +825,10 @@ function add_launched_workers(
                 "resourcegroup" => fromconfig.userdata["resourcegroup"],
                 "scalesetname" => fromconfig.userdata["scalesetname"])
 
-            if placement !== nothing && topology !== nothing && worker_per_vm !== nothing
+            if placement !== nothing && topology !== nothing && ppi !== nothing
                 merge!(
                     wconfig.userdata,
-                    worker_placement_metadata(topology, placement, worker_per_vm))
+                    worker_placement_metadata(topology, placement, ppi))
             end
 
             let wconfig=wconfig

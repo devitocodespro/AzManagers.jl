@@ -343,7 +343,7 @@ Create a VM, and returns a named tuple `(name,ip,resourcegrup,subscriptionid)` w
 # Notes
 [1] Interactive threads are supported beginning in version 1.9 of Julia.  For earlier versions, the default for `julia_num_threads` is `Threads.nthreads()`.
 """
-function addproc(vm_template::Dict, nic_template=nothing;
+function addproc(vm_template::AbstractDict, nic_template=nothing;
         name = "",
         basename = "cbox",
         user = "",

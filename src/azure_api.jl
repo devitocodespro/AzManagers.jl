@@ -305,7 +305,7 @@ function quotacheck(manager, subscriptionid, template, δn, nretry, verbose)
     ncores_available - (ncores_per_machine * δn), ncores_spot_available - (ncores_per_machine * δn)
 end
 
-function nphysical_cores(template::Dict; session=AzSession())
+function nphysical_cores(template::AbstractDict; session=AzSession())
     ssid = template["subscriptionid"]
     region = template["value"]["location"]
     sku_name = template["value"]["properties"]["hardwareProfile"]["vmSize"]
@@ -315,15 +315,22 @@ function nphysical_cores(template::Dict; session=AzSession())
         ["Authorization" => "Bearer $(token(session))"])
     r = JSON.parse(String(_r.body))
 
-
     filtered_skus = filter(sku -> sku["name"] == sku_name && haskey(sku, "capabilities") && any(location -> location == region, sku["locations"]), r["value"])
+    isempty(filtered_skus) && error("SKU $sku_name not found in region $region")
+    capabilities = filtered_skus[1]["capabilities"]
 
-    vCPU_details = [(cap["value"], any(cap -> cap["name"] == "HyperThreadingEnabled" && cap["value"] == "true", sku["capabilities"])) for sku in filtered_skus for cap in sku["capabilities"] if cap["name"] == "vCPUs"]
-    hyperthreading = vCPU_details[1][2]
-    vCPU = vCPU_details[1][1]
+    # Azure's compute SKUs API exposes hyperthreading via the documented
+    # `vCPUsPerCore` capability (1 = HT off, 2 = HT on); the `HyperThreadingEnabled`
+    # capability is not reliably emitted for every SKU family (notably the v3
+    # family, where it is absent), which would silently return vCPU as if HT
+    # were disabled.
+    cap_value(name, default) = let k = findfirst(c -> c["name"] == name, capabilities)
+        k === nothing ? default : capabilities[k]["value"]
+    end
 
-    # Number of physical cores
-    pCPU = hyperthreading ? div(parse(Int,vCPU),2) : parse(Int,vCPU)
+    vCPU = parse(Int, cap_value("vCPUs", "1"))
+    vcpus_per_core = parse(Int, cap_value("vCPUsPerCore", "1"))
+    div(vCPU, vcpus_per_core)
 end
 
 function nphysical_cores(template::AbstractString; session=AzSession())

@@ -484,7 +484,7 @@ function prune_scalesets()
             is_vm_deleting = lowercase(vm_state) == "deleting"
             ispruned_already = scaleset ∈ keys(manager.pruned) && instanceid ∈ manager.pruned[scaleset]
 
-            doprune = (time_elapsed > worker_timeout || vm_state == "failed") && !is_worker_deleting && !is_vm_deleting && !ispruned_already
+            doprune = time_elapsed > worker_timeout && !is_worker_deleting && !is_vm_deleting && !ispruned_already
             if doprune
                 vm_name = get(_vm, "name", "unknown")
                 power_state = lowercase(get(get(get(_vm, "properties", Dict()), "instanceView", Dict()), "powerState", get(get(_vm, "properties", Dict()), "provisioningState", "unknown")))

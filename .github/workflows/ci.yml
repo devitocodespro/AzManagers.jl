@@ -41,6 +41,16 @@ jobs:
       - name: Create an SSH Key Pair
         run: ssh-keygen -f /home/runner/.ssh/azmanagers_rsa -N ''
 
+      - name: Ensure base image exists
+        # First-run bootstrap: if the long-lived base SIG image is missing,
+        # build it now (~10min). Idempotent - skips on every subsequent
+        # CI run. Avoids the chicken-and-egg where workflow_dispatch on
+        # refresh-base-image.yml can't be used until the workflow file
+        # itself reaches the default branch.
+        run: |
+          az login --service-principal -u "$CLIENT_ID" -p "$CLIENT_SECRET" -t "$TENANT_ID"
+          bash "${GITHUB_WORKSPACE}/scripts/ensure_base_image.sh"
+
       - name: Create Prereq. Azure Resources
         run: |
           az login --service-principal   -u "$CLIENT_ID" -p "$CLIENT_SECRET" -t "$TENANT_ID"

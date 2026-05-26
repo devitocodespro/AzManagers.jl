@@ -51,6 +51,14 @@ jobs:
         with:
           version: "1"
 
+      - name: Ensure base image exists
+        # First-run bootstrap for the long-lived base SIG image (see
+        # scripts/ensure_base_image.sh). Idempotent: a no-op on every
+        # subsequent dispatch.
+        run: |
+          az login --service-principal -u "$CLIENT_ID" -p "$CLIENT_SECRET" -t "$TENANT_ID"
+          bash "${GITHUB_WORKSPACE}/scripts/ensure_base_image.sh"
+
       - name: Provision RG, build VNet/NSG, gallery
         run: |
           az login --service-principal -u "$CLIENT_ID" -p "$CLIENT_SECRET" -t "$TENANT_ID"

@@ -818,12 +818,20 @@ function add_launched_workers(
             wconfig.bind_addr = bind_addr
             wconfig.port = port
             wconfig.count = fromconfig.count
+            # Additional workers (ppi > 1) share the underlying scale-set
+            # instance with the primary worker, so inherit `instanceid`
+            # and `priority` from `fromconfig`. Without them, `ispreempted`
+            # KeyErrors on `u["instanceid"]` during `rmprocs` cleanup
+            # (upstream had the same gap; ci.yml's ppi=1 path never
+            # exercised it).
             wconfig.userdata = Dict(
                 "localid" => placement === nothing ? localid + 1 : placement.localid,
                 "name" => fromconfig.userdata["name"],
                 "subscriptionid" => fromconfig.userdata["subscriptionid"],
                 "resourcegroup" => fromconfig.userdata["resourcegroup"],
-                "scalesetname" => fromconfig.userdata["scalesetname"])
+                "scalesetname" => fromconfig.userdata["scalesetname"],
+                "instanceid" => get(fromconfig.userdata, "instanceid", ""),
+                "priority" => get(fromconfig.userdata, "priority", ""))
 
             if placement !== nothing && topology !== nothing && ppi !== nothing
                 merge!(

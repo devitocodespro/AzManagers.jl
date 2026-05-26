@@ -218,6 +218,13 @@ jobs:
           EXPECTED_NUMA: "${{ matrix.expected_numa }}"
           EXPECTED_SOCK: "${{ matrix.expected_sock }}"
         run: |
+          # Explicit pipefail so `ssh ... | tee log` exits non-zero when
+          # ssh (and therefore the remote julia) does. Without this the
+          # pipeline returns tee's exit code (always 0) and the shard
+          # passes even when the test errors - the "green on red" the user
+          # was seeing.
+          set -o pipefail
+
           ipaddress=$(az network public-ip show -g "$RESOURCE_GROUP" -n "$COORD_PIP" \
               | jq -r '.ipAddress')
 
@@ -260,6 +267,15 @@ jobs:
 
           julia ~/multi_worker_test.jl ~/.azmanagers/multi_worker_test.toml
           EOF
+
+          # Belt-and-braces: PIPESTATUS captures the exit code of the
+          # ssh process specifically. If pipefail is off (older bash, or
+          # a runner config tweak), this still propagates failure.
+          ssh_status=${PIPESTATUS[0]}
+          if [ "$ssh_status" -ne 0 ]; then
+              echo "::error::multi-worker test failed (ssh exit=$ssh_status)"
+              exit "$ssh_status"
+          fi
 
       - name: Upload test log
         if: always()

@@ -272,21 +272,84 @@ function build_test_templates(cfg)
     AzSession(; protocal = AzClientCredentials)
 end
 
+function log_section(title)
+    bar = "=" ^ 70
+    @info bar
+    @info title
+    @info bar
+end
+
+"""
+Probe one worker for the SKU's machine topology and log it. Gives a
+clear reference point for what placement is being computed against,
+before any per-worker placement is dumped.
+"""
+function dump_machine_topology()
+    log_section("Machine topology (as seen by worker $(first(workers())))")
+    topo = remotecall_fetch(first(workers())) do
+        try
+            t = AzManagers.detect_machine_topology()
+            (
+                ok = true,
+                physical_cores = t.physical_cores,
+                logical_cpus   = length(t.logical_cpus),
+                hyperthreading = t.hyperthreading,
+                sockets        = length(t.sockets),
+                numa_nodes     = length(t.numa_nodes),
+                socket_cpus    = [(s.id, length(s.cpu_set)) for s in t.sockets],
+                numa_cpus      = [(n.id, n.socket_id, length(n.cpu_set)) for n in t.numa_nodes],
+            )
+        catch e
+            (ok = false, error = sprint(showerror, e))
+        end
+    end
+    if !topo.ok
+        @warn "detect_machine_topology failed on worker" error=topo.error
+        return
+    end
+    @info("topology",
+          physical_cores = topo.physical_cores,
+          logical_cpus   = topo.logical_cpus,
+          hyperthreading = topo.hyperthreading,
+          sockets        = topo.sockets,
+          numa_nodes     = topo.numa_nodes)
+    for (sid, ncpu) in topo.socket_cpus
+        @info "  socket $sid: $ncpu logical CPUs"
+    end
+    for (nid, sid, ncpu) in topo.numa_cpus
+        @info "  numa $nid (socket $sid): $ncpu logical CPUs"
+    end
+end
+
 function dump_worker_placements()
+    log_section("Per-worker placement (planner output, recorded at handshake)")
     placements = worker_placements()
     for pid in sort(collect(keys(placements)))
         info = placements[pid]
-        cpu_set  = get(info, "cpu_set", "?")
-        numa     = get(info, "numa_node", "?")
-        socket   = get(info, "socket", "?")
-        backend  = get(info, "pinning_backend", "?")
-        threads  = get(info, "julia_threads", "?")
-        @info "worker $pid: cpu_set=$cpu_set numa_node=$numa socket=$socket julia_threads=$threads backend=$backend"
+        hostname = try
+            remotecall_fetch(gethostname, pid)
+        catch
+            "<unreachable>"
+        end
+        # `@info(msg, k=v...)` produces a multi-line log entry with each
+        # key on its own line - much easier to scan in CI than the single
+        # "k=v k=v k=v" form.
+        @info("worker pid=$pid",
+              hostname        = hostname,
+              localid         = get(info, "localid", "?"),
+              cpu_set         = get(info, "cpu_set", "?"),
+              numa_node       = get(info, "numa_node", "?"),
+              socket          = get(info, "socket", "?"),
+              julia_threads   = get(info, "julia_threads", "?"),
+              pinning_backend = get(info, "pinning_backend", "?"),
+              physical_cores  = get(info, "physical_cores", "?"),
+              omp_threads     = get(info, "omp_threads", "?"))
     end
     placements
 end
 
-function assert_taskset_matches(placements)
+function check_taskset_matches(placements)
+    log_section("taskset affinity check (kernel-observed vs planner expected)")
     for pid in workers()
         info = get(placements, pid, Dict())
         expected = get(info, "cpu_set", "")
@@ -297,18 +360,55 @@ function assert_taskset_matches(placements)
                 "taskset failed: $e"
             end
         end
-        @info "taskset for pid $pid expected=$expected got=$affinity"
+        # The `affinity` line from taskset is "pid <N>'s current affinity list: <range>"
+        # - assert the expected range is in there. Empty `expected` is the
+        # ppi=1 path where no cpu_set was planned; skip in that case.
+        if isempty(expected)
+            @info "pid $pid: no cpu_set planned (ppi=1 path); skipping affinity check" taskset=affinity
+        else
+            match = occursin(expected, affinity)
+            if match
+                @info "pid $pid: PASS" expected=expected taskset=affinity
+            else
+                @warn "pid $pid: FAIL - expected '$expected' not present in affinity" expected=expected taskset=affinity
+            end
+            @test match
+        end
     end
 end
 
-function teardown(cfg, group)
+"""
+Print a per-worker side-by-side comparison of what each worker is bound
+to (cpu_set, NUMA, socket) so you can eyeball whether the distribution
+makes sense for the SKU and ppi.
+"""
+function dump_distribution_summary(placements)
+    log_section("Placement distribution summary")
+    cpu_sets  = unique(get(p, "cpu_set",   "")       for p in values(placements))
+    numas     = unique(get(p, "numa_node", nothing)  for p in values(placements))
+    sockets   = unique(get(p, "socket",    nothing)  for p in values(placements))
+    @info("distinct counts across workers",
+          workers        = length(placements),
+          unique_cpu_sets = length(cpu_sets),
+          unique_numa    = length(numas),
+          unique_sockets = length(sockets),
+          numa_values    = sort(collect(numas);    by = x -> something(x, -1)),
+          socket_values  = sort(collect(sockets);  by = x -> something(x, -1)),
+          cpu_sets       = sort(collect(cpu_sets)))
+end
+
+function teardown(cfg, group, session)
     if get_bool(cfg, :scenarios, :keep)
         @warn "scenarios.keep=true; leaving workers + scale set '$group' running"
         return
     end
     isempty(workers()) || rmprocs(workers())
     try
-        AzManagers.rmgroup(group)
+        # `rmgroup` defaults to `session=AzSession(;lazy=true)` which on
+        # first token() falls through to device-code flow - hangs the
+        # CI shard for 15 minutes then errors expired_token. Pass the
+        # service-principal session explicitly.
+        AzManagers.rmgroup(group; session=session)
     catch e
         @warn "rmgroup($group) failed; check scale set manually" exception=e
     end
@@ -318,19 +418,25 @@ end
 function run_basic_scenario(cfg, session)
     group = "mwt-basic-" * randstring('a':'z', 4)
     spot  = get_bool(cfg, :azure, :spot; default = true)
-    @info "addprocs basic: group=$group n=1 ppi=1 spot=$spot"
+    log_section("Basic scenario: ppi=1, n=1, spot=$spot, group=$group")
+    @info "calling addprocs..."
+    t_start = time()
     addprocs(AzManager(), TEMPLATE_NAME, 1;
         waitfor = true,
         ppi     = 1,
         spot    = spot,
         group,
         session)
+    @info "addprocs returned" elapsed_s=round(time() - t_start; digits=1) nworkers=nworkers()
     try
-        @assert nworkers() == 1
-        hostname = remotecall_fetch(gethostname, first(workers()))
-        @info "basic worker hostname=$hostname"
+        @testset "basic scenario" begin
+            @test nworkers() == 1
+            pid = first(workers())
+            hostname = remotecall_fetch(gethostname, pid)
+            @info "worker pid=$pid hostname=$hostname"
+        end
     finally
-        teardown(cfg, group)
+        teardown(cfg, group, session)
     end
 end
 
@@ -338,23 +444,39 @@ function run_placement_scenario(cfg, session)
     group = "mwt-place-" * randstring('a':'z', 4)
     ppi   = get_int(cfg, :scenarios, :ppi; default = 2)
     spot  = get_bool(cfg, :azure, :spot; default = true)
-    @info "addprocs placement: group=$group n=1 ppi=$ppi spot=$spot"
+    expected_numa = get_int(cfg, :scenarios, :expected_numa_nodes; default = 0)
+    expected_sock = get_int(cfg, :scenarios, :expected_sockets;    default = 0)
+    sku   = get_field(cfg, :azure, :sku_name; default = "?")
+
+    log_section("Placement scenario: SKU=$sku ppi=$ppi n=1 spot=$spot")
+    @info("expected (from matrix shard)",
+          ppi               = ppi,
+          distinct_numa     = expected_numa,
+          distinct_sockets  = expected_sock,
+          interpretation    = "each of $ppi workers should land on its own slice; counts above are how many UNIQUE values across workers")
+    @info "calling addprocs..." group=group
+    t_start = time()
     addprocs(AzManager(), TEMPLATE_NAME, 1;
         waitfor = true,
         ppi     = ppi,
         spot    = spot,
         group,
         session)
+    @info "addprocs returned" elapsed_s=round(time() - t_start; digits=1) nworkers=nworkers()
     try
-        @assert nworkers() == ppi
-        placements = dump_worker_placements()
-        cpu_sets = [get(p, "cpu_set", "") for p in values(placements)]
-        @assert all(!isempty, cpu_sets) "some workers reported empty cpu_set"
-        @assert length(unique(cpu_sets)) == ppi "cpu_sets are not disjoint: $cpu_sets"
-        assert_taskset_matches(placements)
-        assert_topology_matches(cfg, placements)
+        @testset "placement scenario (ppi=$ppi)" begin
+            @test nworkers() == ppi
+            dump_machine_topology()
+            placements = dump_worker_placements()
+            dump_distribution_summary(placements)
+            cpu_sets = [get(p, "cpu_set", "") for p in values(placements)]
+            @test all(!isempty, cpu_sets)
+            @test length(unique(cpu_sets)) == ppi
+            check_taskset_matches(placements)
+            check_topology_matches(cfg, placements)
+        end
     finally
-        teardown(cfg, group)
+        teardown(cfg, group, session)
     end
 end
 
@@ -363,22 +485,37 @@ end
 # [scenarios] expected_numa_nodes / expected_sockets keys); each is the count
 # of distinct values the planner is expected to assign across ppi workers.
 # Missing/zero means "don't check".
-function assert_topology_matches(cfg, placements)
+function check_topology_matches(cfg, placements)
+    log_section("Topology distribution check (matrix-defined expectations)")
     expected_numa = get_int(cfg, :scenarios, :expected_numa_nodes; default = 0)
     expected_sock = get_int(cfg, :scenarios, :expected_sockets;    default = 0)
 
     if expected_numa > 0
-        observed = unique(get(p, "numa_node", nothing) for p in values(placements))
-        @info "topology: expected_numa_nodes=$expected_numa observed=$(sort(collect(observed)))"
-        @assert length(observed) == expected_numa "numa_node distribution mismatch: \
-            expected $expected_numa distinct nodes, observed $(length(observed)): $observed"
+        observed = sort(collect(unique(get(p, "numa_node", nothing) for p in values(placements)));
+                        by = x -> something(x, -1))
+        observed_distinct = length(observed)
+        if observed_distinct == expected_numa
+            @info "numa_node distribution: PASS" expected_distinct=expected_numa observed_distinct=observed_distinct observed_values=observed
+        else
+            @warn "numa_node distribution: FAIL" expected_distinct=expected_numa observed_distinct=observed_distinct observed_values=observed
+        end
+        @test observed_distinct == expected_numa
+    else
+        @info "numa_node distribution: skipped (expected_numa_nodes=0)"
     end
 
     if expected_sock > 0
-        observed = unique(get(p, "socket", nothing) for p in values(placements))
-        @info "topology: expected_sockets=$expected_sock observed=$(sort(collect(observed)))"
-        @assert length(observed) == expected_sock "socket distribution mismatch: \
-            expected $expected_sock distinct sockets, observed $(length(observed)): $observed"
+        observed = sort(collect(unique(get(p, "socket", nothing) for p in values(placements)));
+                        by = x -> something(x, -1))
+        observed_distinct = length(observed)
+        if observed_distinct == expected_sock
+            @info "socket distribution: PASS" expected_distinct=expected_sock observed_distinct=observed_distinct observed_values=observed
+        else
+            @warn "socket distribution: FAIL" expected_distinct=expected_sock observed_distinct=observed_distinct observed_values=observed
+        end
+        @test observed_distinct == expected_sock
+    else
+        @info "socket distribution: skipped (expected_sockets=0)"
     end
 end
 
@@ -387,11 +524,20 @@ function run_mpi_nested_scenario(cfg, session)
     ppi                  = get_int(cfg, :scenarios, :ppi; default = 2)
     mpi_ranks_per_worker = get_int(cfg, :scenarios, :mpi_ranks_per_worker; default = 2)
     spot                 = get_bool(cfg, :azure, :spot; default = true)
+    sku                  = get_field(cfg, :azure, :sku_name; default = "?")
     # mpi_flags defaults to "" so the auto-emitted `--bind-to cpu-list:ordered`
     # is not overridden. Set scenarios.mpi_flags in the TOML if your image
     # needs extra mpirun flags.
     mpi_flags = string(get_field(cfg, :scenarios, :mpi_flags; default = "", required = false))
-    @info "addprocs MPI nested: group=$group ppi=$ppi mpi_ranks_per_worker=$mpi_ranks_per_worker spot=$spot"
+
+    log_section("MPI-nested scenario: SKU=$sku ppi=$ppi ranks/worker=$mpi_ranks_per_worker spot=$spot")
+    @info("expected",
+          julia_workers       = ppi,
+          mpi_ranks_per_worker = mpi_ranks_per_worker,
+          total_mpi_ranks      = ppi * mpi_ranks_per_worker,
+          mpi_flags            = mpi_flags)
+    @info "calling addprocs..." group=group
+    t_start = time()
     addprocs(AzManager(), TEMPLATE_NAME, 1;
         waitfor              = true,
         ppi                  = ppi,
@@ -400,21 +546,33 @@ function run_mpi_nested_scenario(cfg, session)
         spot                 = spot,
         group,
         session)
+    @info "addprocs returned" elapsed_s=round(time() - t_start; digits=1) nworkers=nworkers()
     try
-        @assert nworkers() == ppi "expected $ppi julia workers, got $(nworkers())"
-        for pid in workers()
-            rank_count = remotecall_fetch(pid) do
-                try
-                    Base.invokelatest(eval, :(using MPI; MPI.Comm_size(MPI.COMM_WORLD)))
-                catch e
-                    "MPI introspection failed: $e"
+        @testset "MPI nested scenario (ppi=$ppi, ranks/worker=$mpi_ranks_per_worker)" begin
+            @test nworkers() == ppi
+            log_section("MPI rank introspection (one MPI.Comm_size call per worker)")
+            for pid in workers()
+                hostname = try; remotecall_fetch(gethostname, pid); catch; "<unreachable>"; end
+                rank_count = remotecall_fetch(pid) do
+                    try
+                        Base.invokelatest(eval, :(using MPI; MPI.Comm_size(MPI.COMM_WORLD)))
+                    catch e
+                        "MPI introspection failed: $e"
+                    end
                 end
+                if rank_count == mpi_ranks_per_worker
+                    @info "pid $pid: PASS" hostname=hostname expected=mpi_ranks_per_worker got=rank_count
+                else
+                    @warn "pid $pid: FAIL" hostname=hostname expected=mpi_ranks_per_worker got=rank_count
+                end
+                @test rank_count == mpi_ranks_per_worker
             end
-            @info "worker $pid MPI.Comm_size=$rank_count"
+            dump_machine_topology()
+            placements = dump_worker_placements()
+            dump_distribution_summary(placements)
         end
-        dump_worker_placements()
     finally
-        teardown(cfg, group)
+        teardown(cfg, group, session)
     end
 end
 

@@ -546,7 +546,7 @@ Filter an arbitrary user-data dictionary down to the keys that describe a
 worker placement, discarding everything else. Used when the master pulls
 the worker's metadata out of a larger config bundle.
 """
-function placement_userdata(userdata::Dict)
+function placement_userdata(userdata::AbstractDict)
     Dict(key => userdata[key] for key in PLACEMENT_USERDATA_KEYS if haskey(userdata, key))
 end
 

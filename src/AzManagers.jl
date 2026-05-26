@@ -957,7 +957,28 @@ function image_osdisksize(manager::AzManager, template, sigimagename, sigimageve
         b = JSON.parse(String(r.body))
         osdisksize = b["properties"]["storageProfile"]["osDiskImage"]["sizeInGB"]
     else
-        error("unable to determine os disk size")
+        # The two branches above require either managed-image-only
+        # (imagename set, sig fields empty) or SIG-with-version
+        # (sig fields set, imagename empty). Any other combination means
+        # `scaleset_image()` returned something partial - usually because
+        # the coordinator's IMDS query for the imageReference URL came
+        # back in an unexpected shape (e.g. SIG without /versions/X and
+        # the versions-listing API also didn't yield a result). Print
+        # what we have so the next CI failure points at the actual gap.
+        image_id = try
+            if haskey(template["properties"], "virtualMachineProfile")
+                template["properties"]["virtualMachineProfile"]["storageProfile"]["imageReference"]["id"]
+            else
+                template["properties"]["storageProfile"]["imageReference"]["id"]
+            end
+        catch
+            "<unavailable>"
+        end
+        error("unable to determine os disk size " *
+              "(sigimagename=\"$sigimagename\", " *
+              "sigimageversion=\"$sigimageversion\", " *
+              "imagename=\"$imagename\", " *
+              "template_image_id=\"$image_id\")")
     end
 
     @debug "found os disk size: $osdisksize GB"

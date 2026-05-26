@@ -87,15 +87,21 @@ jobs:
             -var "virtual_network=${VNET_NAME}" \
             -var "virtual_subnet=default" \
             -var "gallery=${GALLERY_NAME}" \
-            -var "azmanagers_version=${{ github.sha }}" \
+            -var "azmanagers_version=${{ github.event.pull_request.head.sha || github.sha }}" \
             -var "azmanagers_repo=https://github.com/${{ github.repository }}.git" \
             -var "location=eastus" \
             -var "vm_size=Standard_D4s_v3" \
             ${GITHUB_WORKSPACE}/test/image.pkr.hcl
 
       - name: Create coordinator VM
+        # On-demand (NOT spot). The coordinator runs the entire test suite
+        # over SSH from the GHA runner; an eviction mid-test deletes the VM
+        # (eviction-policy=Delete), drops the public IP, and the ssh session
+        # dies with "client_loop: send disconnect: Broken pipe". D2s_v3 spot
+        # in eastus is flaky and the price delta vs on-demand is ~0%, so
+        # there is no reason to take the eviction risk on the driver.
         run: |
-          az vm create -g "$RESOURCE_GROUP" -n "$VM_NAME" --image "$IMAGE_NAME" --size Standard_D2s_v3 --public-ip-sku Standard --public-ip-address "$PUBLIC_IP_NAME" --subnet "$SUBNET_NAME" --vnet-name "$VNET_NAME" --nsg "$NSG_NAME" --ssh-key-values @/home/runner/.ssh/azmanagers_rsa.pub --admin-username cvx --priority Spot --max-price -1 --eviction-policy Delete
+          az vm create -g "$RESOURCE_GROUP" -n "$VM_NAME" --image "$IMAGE_NAME" --size Standard_D2s_v3 --public-ip-sku Standard --public-ip-address "$PUBLIC_IP_NAME" --subnet "$SUBNET_NAME" --vnet-name "$VNET_NAME" --nsg "$NSG_NAME" --ssh-key-values @/home/runner/.ssh/azmanagers_rsa.pub --admin-username cvx
 
       - name: Run the unit tests
         # 90 min hard ceiling - one full successful run is ~35 min; this lets

@@ -101,7 +101,7 @@ jobs:
             -var "virtual_network=${VNET_NAME}" \
             -var "virtual_subnet=${SUBNET_NAME}" \
             -var "gallery=${GALLERY_NAME}" \
-            -var "azmanagers_version=${{ github.sha }}" \
+            -var "azmanagers_version=${{ github.event.pull_request.head.sha || github.sha }}" \
             -var "azmanagers_repo=https://github.com/${{ github.repository }}.git" \
             ${GITHUB_WORKSPACE}/test/image.pkr.hcl
 
@@ -193,15 +193,15 @@ jobs:
               --vnet-name "$VNET_NAME" --network-security-group "$NSG_NAME"
 
       - name: Create coordinator VM
+        # On-demand (NOT spot). The coordinator drives the per-shard test
+        # over SSH; a mid-test eviction would delete the VM and kill the
+        # ssh session (broken pipe), failing the shard for a reason
+        # unrelated to what we are testing. Worker scale-sets in the shard
+        # still use spot (that is the actual code-under-test path).
+        # --size is explicit because the az CLI default (Standard_DS1_v2)
+        # is frequently capacity-constrained in eastus; DSv3 has plenty of
+        # both quota and capacity in this region.
         run: |
-          # Coordinator is launched as a spot VM (eviction-policy=Delete so
-          # there is nothing to clean up if Azure reclaims it). If the
-          # coordinator gets evicted mid-test the shard fails, which is
-          # acceptable for a CI flow - the workflow's cleanup job tears the
-          # whole RG down regardless.
-          # --size is explicit because the az CLI default (Standard_DS1_v2)
-          # is frequently capacity-constrained in eastus; DSv3 has plenty of
-          # both quota and capacity in this region.
           az vm create \
               -g "$RESOURCE_GROUP" -n "$COORD_VM" -l "$LOCATION" \
               --image "$IMAGE_NAME" \
@@ -210,8 +210,7 @@ jobs:
               --public-ip-address "$COORD_PIP" \
               --subnet "$SUBNET_NAME" --vnet-name "$VNET_NAME" --nsg "$NSG_NAME" \
               --ssh-key-values @/home/runner/.ssh/azmanagers_rsa.pub \
-              --admin-username cvx \
-              --priority Spot --max-price -1 --eviction-policy Delete
+              --admin-username cvx
 
       - name: Run test (basic + placement) for ${{ matrix.sku }}
         env:

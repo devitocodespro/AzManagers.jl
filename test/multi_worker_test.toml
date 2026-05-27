@@ -1,7 +1,7 @@
 # AzManagers multi-worker test configuration.
 #
 # Copy this file to ~/.azmanagers/multi_worker_test.toml (or anywhere; pass
-# the path as the first CLI arg to demo/multi_worker_test.jl). Fill in the
+# the path as the first CLI arg to test/multi_worker_test.jl). Fill in the
 # REPLACE-ME placeholders with values from your Azure subscription. The
 # script reads it at startup; any field may be overridden at runtime with
 # an env var named SECTION_FIELD in upper-snake-case,

@@ -31,7 +31,7 @@ or configure user-defined routes (UDR) in the subnet. Learn more at aka.ms/defau
 =#
 @testset "AzManagers, addprocs, ppi=$ppi, flexible=$flexible" for ppi in (1,), flexible in (false,#=true=#)
     ninstances = 4
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
     
     # Set up iteration vars
     url = "https://management.azure.com/subscriptions/$subscriptionid/resourceGroups/$resourcegroup/providers/Microsoft.Compute/virtualMachineScaleSets/$group?api-version=2019-12-01"
@@ -135,7 +135,7 @@ end
 # when you need to debug the spot path against cbox02 specifically.
 if get(ENV, "AZMANAGERS_RUN_SPOT_TESTS", "false") == "true"
 @testset "addprocs, spot" begin
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
     julia_num_threads = VERSION >= v"1.9" ? "2,0" : "2"
     addprocs(templatename, 1; waitfor = true, group, session, julia_num_threads)
 
@@ -146,7 +146,7 @@ if get(ENV, "AZMANAGERS_RUN_SPOT_TESTS", "false") == "true"
     end
     rmprocs(workers())
 
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
     julia_num_threads = VERSION >= v"1.9" ? "2,0" : "2"
     addprocs(templatename, 1; waitfor = true, group, session, julia_num_threads, spot = true)
 
@@ -159,7 +159,7 @@ if get(ENV, "AZMANAGERS_RUN_SPOT_TESTS", "false") == "true"
     end
     rmprocs(workers())
 
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
     julia_num_threads = VERSION >= v"1.9" ? "3,2" : "3"
     addprocs(templatename, 1; waitfor = true, group, session, julia_num_threads, spot=true)
 
@@ -173,7 +173,7 @@ end
 
 if VERSION >= v"1.9"
     @testset "spot eviction" begin
-        group = "test$(randstring('a':'z',4))"
+        group = "test$(randstring('a':'z',8))"
         julia_num_threads = "2,1"
         addprocs(templatename, 2; waitfor = true, group, session, julia_num_threads, spot = true)
 
@@ -228,7 +228,7 @@ end  # if AZMANAGERS_RUN_SPOT_TESTS
 
     write("LocalPreferences.toml", "[FooPackage]\nfoo = \"bar\"\n")
 
-    r = randstring('a':'z',4)
+    r = randstring('a':'z',8)
     bname = "test$r"
 
     testvm = addproc(templatename; basename=bname, session=session, customenv=true)
@@ -264,7 +264,7 @@ end
 
     Pkg.add(PackageSpec(name="AzManagers", url=azmanagers_url, rev=azmanagers_rev))
 
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
 
     @info "[envaddprocs] calling addprocs with customenv=true" group
     addprocs(templatename, 1; waitfor=true, group=group, session=session, customenv=true)
@@ -306,7 +306,7 @@ end
 
     Pkg.add(PackageSpec(name="AzManagers", url=azmanagers_url, rev=azmanagers_rev))
 
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
 
     templates_scaleset = JSON.parse(read(AzManagers.templates_filename_scaleset(), String))
     template = templates_scaleset[templatename]
@@ -333,7 +333,7 @@ end
 end
 
 @testset "AzManagers, addproc, and test if nthreads propagates properly" begin
-    r = randstring('a':'z',4)
+    r = randstring('a':'z',8)
     basename = "test$r"
     testvm = addproc(templatename; basename=basename, session=session, julia_num_threads="1,2")
     testjob = @detachat testvm begin
@@ -399,7 +399,7 @@ end
 end
 
 @testset "AzManagers, detach, variablebundle" begin
-    r = randstring('a':'z',4)
+    r = randstring('a':'z',8)
     basename = "test$r"
     testvm = addproc(templatename; basename=basename, session=session)
     variablebundle!(a=1.0,b=3.14)
@@ -426,7 +426,7 @@ end
 
 @testset "AzManagers, physical_hostname" begin
 
-    group = "test$(randstring('a':'z',4))"
+    group = "test$(randstring('a':'z',8))"
 
     templates_scaleset = JSON.parse(read(AzManagers.templates_filename_scaleset(), String))
     template = templates_scaleset[templatename]
@@ -448,7 +448,7 @@ end
 end
 
 @testset "AzManagers, addproc physical_hostname" begin
-    r = randstring('a':'z',4)
+    r = randstring('a':'z',8)
     basename = "test$r"
     testvm = addproc(templatename; basename=basename, session=session)
 

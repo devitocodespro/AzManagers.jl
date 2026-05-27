@@ -111,7 +111,13 @@ source "azure-arm" "cofii" {
         gallery_name = var.gallery
         image_name = var.image_name
         image_version = var.image_version
-        replication_regions = ["East US"]
+        # Regions the per-run SIG image is replicated to. Keep this in
+        # sync with the matrix locations in multi-worker-test.yml and
+        # ci.yml. Each extra region adds a few minutes of replication
+        # time during packer build but lets shards in that region boot
+        # their coordinator VM from this image. South Central US is in
+        # for the HB176rs_v5 shard.
+        replication_regions = ["East US", "South Central US"]
     }
     shared_image_gallery_timeout = "120m"
     build_resource_group_name = var.resource_group

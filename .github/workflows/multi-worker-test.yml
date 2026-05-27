@@ -8,7 +8,7 @@ name: Multi-Worker Test (SKU matrix)
 #   setup   - one-time per run: RG, build VNet/NSG, gallery, Packer image.
 #   test    - matrix over SKUs. Each shard creates its own per-region
 #             VNet/NSG and small coordinator VM in the shared RG, sshes in,
-#             runs demo/multi_worker_test.jl with the matrix SKU + expected
+#             runs test/multi_worker_test.jl with the matrix SKU + expected
 #             topology, tears down its scale set + coordinator VM.
 #   cleanup - if: always(), deletes the RG (catches anything the per-shard
 #             teardown missed).
@@ -109,6 +109,14 @@ jobs:
     name: SKU ${{ matrix.sku }} (${{ matrix.location }})
     needs: setup
     runs-on: ubuntu-latest
+    # Per-shard ceiling. Spot allocation for HPC SKUs (HC, HBv*) in
+    # popular regions can sit in Azure's queue indefinitely waiting for
+    # capacity; GHA's default job timeout is 6h, so without this a single
+    # shard can burn the whole workflow budget. 60 min is ample for a
+    # healthy run (~20-30 min: coordinator boot + ppi=1/sockets/numa/2*
+    # numa sweep + teardown), so this only fires when the SKU genuinely
+    # has no capacity.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       # Shards run sequentially so peak spot vCPU consumption is the size of
@@ -118,46 +126,42 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          # 120 cores, AMD EPYC 7V73X Milan-X HPC. 2 sockets x 60c,
-          # 4 NUMA per socket (8 total). With ppi=2 the planner assigns
-          # one worker per socket; each worker's CPU set spans 4 NUMA
-          # nodes so no single NUMA contains it -> numa_node=nothing on
-          # both workers, distinct count = 1.
-          - sku:          "Standard_HB120rs_v3"
-            slug:         "hb120v3"
-            location:     "eastus"
-            expected_numa: 1
-            expected_sock: 2
-          # 64 cores, Intel Broadwell. 2 sockets, 1 NUMA per socket.
-          # With ppi=2 each worker maps to one socket = one NUMA.
-          - sku:          "Standard_E64s_v3"
-            slug:         "e64sv3"
-            location:     "eastus"
-            expected_numa: 2
-            expected_sock: 2
-          # 44 cores, Intel Xeon Platinum 8168 Skylake-SP HPC.
-          # 2 sockets x 22c, 1 NUMA per socket. With ppi=2 each worker
-          # maps to one socket = one NUMA.
-          - sku:          "Standard_HC44rs"
-            slug:         "hc44rs"
-            location:     "eastus"
-            expected_numa: 2
-            expected_sock: 2
-          # ---------- larger SKUs disabled to fit a 174-vCPU spot budget ----------
-          # Re-enable by un-commenting + adding the per-family spot quota.
-          # Both v4 and v5 are 2 sockets x 88c with 4 NUMA per socket,
-          # same ppi=2 placement pattern as HBv3 -> numa=1, sock=2.
+          # SKU matrix - just (sku, slug, location). The test derives all
+          # placement expectations from the SKU's own runtime topology;
+          # see run_pinning_matrix_scenario in test/multi_worker_test.jl.
+          # Nothing here hardcodes NUMA / socket counts.
           #
-          # - sku:          "Standard_HB176rs_v4"    # 176c AMD Genoa-X
-          #   slug:         "hb176v4"
-          #   location:     "eastus"
-          #   expected_numa: 1
-          #   expected_sock: 2
-          # - sku:          "Standard_HB176rs_v5"    # 176c AMD Turin-HBM
-          #   slug:         "hb176v5"
-          #   location:     "southcentralus"        # also re-add to replication_regions
-          #   expected_numa: 1
-          #   expected_sock: 2
+          # Per-shard (sku, slug, location, spot). The `spot` knob lets
+          # individual shards opt out of spot pricing when only regular
+          # quota is available (e.g. HBv5 in southcentralus). HC44rs and
+          # HB120v3 stay on spot (cheaper, no regular quota assumed);
+          # HBv5 uses regular priority. The HBv5 shard requires the base
+          # image to be replicated to South Central US - see
+          # `replication_regions` in test/base_image.pkr.hcl. Run
+          # refresh-base-image.yml after changing replication regions.
+          - sku:      "Standard_HC44rs"        # 44c Intel Skylake-SP HPC
+            slug:     "hc44rs"
+            location: "eastus"
+            spot:     "true"
+          - sku:      "Standard_E64s_v3"       # 64c Intel Broadwell
+            slug:     "e64sv3"
+            location: "eastus"
+            spot:     "true"
+          - sku:      "Standard_HB120rs_v3"    # 120c AMD Milan-X
+            slug:     "hb120v3"
+            location: "eastus"
+            spot:     "true"
+          - sku:      "Standard_HB176rs_v5"    # 176c AMD Turin-HBM
+            slug:     "hb176v5"
+            location: "southcentralus"
+            spot:     "false"
+          # ---------- larger SKUs disabled to fit a 174-vCPU spot budget ----------
+          # - sku:      "Standard_HB176rs_v4"    # 176c AMD Genoa-X
+          #   slug:     "hb176v4"
+          #   location: "eastus"
+          # - sku:      "Standard_HB176rs_v5"    # 176c AMD Turin-HBM
+          #   slug:     "hb176v5"
+          #   location: "southcentralus"        # also re-add to replication_regions
     env:
       TENANT_ID:       "${{ secrets.TENANT_ID }}"
       SUBSCRIPTION_ID: "${{ secrets.SUBSCRIPTION_ID }}"
@@ -201,10 +205,26 @@ jobs:
         # --size is explicit because the az CLI default (Standard_DS1_v2)
         # is frequently capacity-constrained in eastus; DSv3 has plenty of
         # both quota and capacity in this region.
+        # Short step timeout: coordinator boot is on-demand DSv3, which
+        # allocates in seconds. Anything beyond ~10 min means the
+        # subscription has a capacity / quota / image-replication issue
+        # that's worth surfacing as a clear failure now rather than after
+        # 30+ min of silent hang.
+        timeout-minutes: 10
         run: |
+          # Reference the SIG image-def explicitly (not the bare name).
+          # `az vm create --image $NAME` resolves bare names to managed
+          # images first; packer publishes both a managed image (single-
+          # region, in the setup job's HOME_LOCATION) AND a SIG image-
+          # version (replicated per test/image.pkr.hcl). The HBv5 shard
+          # runs in southcentralus where the managed image doesn't exist,
+          # so the create errors with "Image cannot be found in
+          # 'southcentralus' region". The full SIG resource ID forces
+          # az to use the SIG image-version, which IS replicated to the
+          # shard's region. Omitting `/versions/X` picks the latest.
           az vm create \
               -g "$RESOURCE_GROUP" -n "$COORD_VM" -l "$LOCATION" \
-              --image "$IMAGE_NAME" \
+              --image "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$GALLERY_NAME/images/$IMAGE_NAME" \
               --size Standard_D2s_v3 \
               --public-ip-sku Standard \
               --public-ip-address "$COORD_PIP" \
@@ -213,10 +233,17 @@ jobs:
               --admin-username cvx
 
       - name: Run test (basic + placement) for ${{ matrix.sku }}
+        # The ppi sweep provisions scale-sets at ppi=1/sockets/numa/2*numa.
+        # If the SKU is on spot and spot capacity isn't available in the
+        # shard's region (HPC SKUs are frequently capacity-constrained),
+        # addprocs waits inside the spinner indefinitely - Azure VMSS
+        # has no built-in allocation deadline. Cap the step so a single
+        # SKU with no capacity right now doesn't burn the whole shard
+        # budget on a wait that will never complete.
+        timeout-minutes: 45
         env:
-          SKU:           "${{ matrix.sku }}"
-          EXPECTED_NUMA: "${{ matrix.expected_numa }}"
-          EXPECTED_SOCK: "${{ matrix.expected_sock }}"
+          SKU:  "${{ matrix.sku }}"
+          SPOT: "${{ matrix.spot }}"
         run: |
           # Explicit pipefail so `ssh ... | tee log` exits non-zero when
           # ssh (and therefore the remote julia) does. Without this the
@@ -231,7 +258,7 @@ jobs:
           # Seed the test config from the annotated template; the
           # SECTION_FIELD env-var overrides fill in the REPLACE-ME values.
           scp -o StrictHostKeyChecking=no -i /home/runner/.ssh/azmanagers_rsa \
-              demo/multi_worker_test.toml demo/multi_worker_test.jl \
+              test/multi_worker_test.toml test/multi_worker_test.jl \
               cvx@$ipaddress:/home/cvx/
 
           # Unquoted heredoc: $VARS expand on the runner; the resulting
@@ -255,14 +282,17 @@ jobs:
           export AZURE_LOCATION="$LOCATION"
           export AZURE_SKU_NAME="$SKU"
           export AZURE_SSH_USER="cvx"
-          export AZURE_SPOT="true"
+          export AZURE_SPOT="$SPOT"
 
-          export SCENARIOS_BASIC="true"
+          # SCENARIOS_PLACEMENT triggers the pinning matrix in
+          # test/multi_worker_test.jl - probes the SKU's topology and
+          # sweeps ppi = 1 / sockets / numa / 2*numa, asserting per
+          # worker that the recorded cpu_set matches the planner and
+          # that the kernel taskset affinity matches the recorded
+          # cpu_set. No hardcoded counts.
+          export SCENARIOS_BASIC="false"
           export SCENARIOS_PLACEMENT="true"
           export SCENARIOS_MPI_NESTED="false"
-          export SCENARIOS_PPI="2"
-          export SCENARIOS_EXPECTED_NUMA_NODES="$EXPECTED_NUMA"
-          export SCENARIOS_EXPECTED_SOCKETS="$EXPECTED_SOCK"
           export SCENARIOS_KEEP="false"
 
           julia ~/multi_worker_test.jl ~/.azmanagers/multi_worker_test.toml

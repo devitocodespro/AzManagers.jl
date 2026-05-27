@@ -31,13 +31,64 @@ set -euo pipefail
 : "${JULIA_VERSION:=1.12.0}"
 : "${AZMANAGERS_REF:=master}"
 : "${AZMANAGERS_REPO:=https://github.com/devitocodespro/AzManagers.jl.git}"
+# Space-separated list of Azure regions the base image-version must be
+# replicated to. Keep in sync with `replication_regions` in
+# test/base_image.pkr.hcl. Each CI shard's coordinator VM boots from
+# this image in its own region (see matrix.location in
+# .github/workflows/multi-worker-test.yml), so every region used by any
+# shard must be in this list.
+: "${EXPECTED_REGIONS:=eastus southcentralus}"
 
-# Fast path: any image-version already published under this image-def
-# means we can skip everything.
-if az sig image-version list \
+# Fast path: any image-version already published under this image-def.
+# If one exists AND it's already replicated to every expected region,
+# skip everything. Otherwise, extend its replication to cover the
+# missing regions - that's much faster (~5-10 min copy) than rebuilding
+# the whole image from scratch (~30 min apt + julia + Pkg.add).
+existing_version="$(az sig image-version list \
         -g "$BASE_RG" -r "$BASE_GALLERY" -i "$BASE_IMAGE" \
-        --query "[0].name" -o tsv 2>/dev/null | grep -q .; then
-    echo "Base image found in $BASE_RG/$BASE_GALLERY/$BASE_IMAGE - skipping build."
+        --query "[0].name" -o tsv 2>/dev/null || true)"
+
+if [ -n "$existing_version" ]; then
+    echo "Base image-version $existing_version found in $BASE_RG/$BASE_GALLERY/$BASE_IMAGE."
+    # Azure region names in publishingProfile can contain spaces (e.g.
+    # "South Central US"), so read az's `-o tsv` line-by-line into a
+    # bash array instead of using shell word-splitting.
+    mapfile -t current_regions < <(az sig image-version show \
+            -g "$BASE_RG" -r "$BASE_GALLERY" -i "$BASE_IMAGE" -e "$existing_version" \
+            --query "publishingProfile.targetRegions[].name" -o tsv)
+    echo "  currently replicated to: ${current_regions[*]}"
+    echo "  required regions:        $EXPECTED_REGIONS"
+
+    # Normalize region names for comparison: lowercase + strip spaces,
+    # so 'East US' and 'eastus' compare equal.
+    normalize() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' '; }
+
+    missing=""
+    for required in $EXPECTED_REGIONS; do
+        required_norm="$(normalize "$required")"
+        found=0
+        for r in "${current_regions[@]}"; do
+            if [ "$(normalize "$r")" = "$required_norm" ]; then
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            missing="$missing $required"
+        fi
+    done
+
+    if [ -z "$missing" ]; then
+        echo "Base image already covers all required regions - skipping build."
+        exit 0
+    fi
+
+    echo "Extending replication of $existing_version to add:$missing"
+    # `--target-regions` is the UNION, not a delta - pass the full list.
+    az sig image-version update \
+        -g "$BASE_RG" -r "$BASE_GALLERY" -i "$BASE_IMAGE" -e "$existing_version" \
+        --target-regions $EXPECTED_REGIONS
+    echo "Replication extended."
     exit 0
 fi
 

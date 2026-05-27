@@ -77,7 +77,11 @@ variable "location" {
 
 variable "replication_regions" {
     type = list(string)
-    default = ["East US"]
+    # Regions that the base image is replicated to. Add a region here
+    # if you want a multi-worker-test.yml shard to boot from this base
+    # in that region. South Central US is included for the HB176rs_v5
+    # shard which only has regular-priority quota there.
+    default = ["East US", "South Central US"]
 }
 
 packer {

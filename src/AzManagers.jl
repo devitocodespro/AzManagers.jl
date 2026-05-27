@@ -252,6 +252,24 @@ function Distributed.addprocs(::AzManager, template::AbstractDict, n::Int;
     user == "" && (user = _manifest["ssh_user"])
 
     manager = azmanager!(session, user, nretry, verbose, save_cloud_init_failures, show_quota)
+
+    # If the caller didn't specify an image, derive it from the scale-set
+    # template's imageReference rather than asking IMDS what the
+    # coordinator booted from. The template's reference is the source
+    # of truth for what the SCALE-SET will run; IMDS is a fallback
+    # (kept below in scaleset_image) for callers that don't pass a
+    # template, e.g. running outside an Azure VM. The IMDS path has
+    # silent failure modes - the @async + fetch + retry stack can land
+    # in a "task returned nothing because @retry exhausted retries on a
+    # transient IMDS hiccup" state and return all-empty strings; the
+    # caller then errors in image_osdisksize with no useful diagnostic.
+    # Extracting from the template here makes the common case
+    # deterministic.
+    if imagename == "" && sigimagename == ""
+        sigimagename, sigimageversion, imagename = _resolve_image_from_template(
+            manager, template["value"], subscriptionid, resourcegroup)
+    end
+
     sigimagename,sigimageversion,imagename = scaleset_image(manager, sigimagename, sigimageversion, imagename)
     scaleset_image!(manager, template["value"], sigimagename, sigimageversion, imagename)
     software_sanity_check(manager, imagename == "" ? sigimagename : imagename, customenv)
@@ -783,18 +801,92 @@ function Distributed.launch_n_additional_processes(manager::AzManager, frompid, 
             fromconfig.userdata,
             worker_placement_metadata(topology, placements[1], cnt + 1))
 
-        for placement in placements[2:end]
-            cmd = worker_launch_command(exename, exeflags, placement; use_numactl)
-            new_addresses = remotecall_fetch(Distributed.launch_additional, frompid, 1, cmd)
+        # Fork ALL additional workers in one call on the primary,
+        # mirroring Distributed.launch_additional's structure (parallel
+        # fork phase + serial bind_addr read phase) but with one cmd
+        # per worker. Calling launch_additional(1, cmd) sequentially N
+        # times is the wrong API shape - each call serializes a full
+        # launch+read, and with N>1 (e.g. ppi=4 needing 3 additional
+        # workers) the cluster gets stuck part-way through. The fork
+        # loop must batch and start the children in parallel so they
+        # can read their cookies + bind their ports concurrently.
+        n_extra = length(placements) - 1
+        @info "launch_n_additional_processes: forking $n_extra additional workers on primary frompid=$frompid"
+        for (i, p) in enumerate(placements[2:end])
+            @info "  placement $i: localid=$(p.localid) cpu_set=$(cpu_set_string(p.cpu_set)) numa_node=$(p.numa_node) socket=$(p.socket)"
+        end
+        cmds = [worker_launch_command(exename, exeflags, p; use_numactl) for p in placements[2:end]]
+        t0 = time()
+        new_addresses = remotecall_fetch(frompid, cmds) do cmd_list
+            io_objs = []
+            addresses = []
+            # Phase 1: fork all children in parallel. Each child
+            # (numactl-wrapped julia --worker) starts up and blocks
+            # reading its cookie from stdin.
+            for cmd in cmd_list
+                io = open(Base.detach(cmd), "r+")
+                Distributed.write_cookie(io)
+                push!(io_objs, io.out)
+            end
+            # Phase 2: collect bind_addrs in order. Each read blocks
+            # until that child has bound its port and printed the addr.
+            for io in io_objs
+                (host, port) = Distributed.read_worker_host_port(io)
+                push!(addresses, (host, port))
+                Distributed.additional_io_objs[port] = io
+            end
+            addresses
+        end
+        @info "  all $n_extra forks done" elapsed_s=round(time()-t0; digits=1) addresses=new_addresses
+
+        # Register each new worker with the master. add_launched_workers
+        # queues an @async create_worker per address; @sync at the top
+        # of this function waits for all of them to complete.
+        for (placement, addr) in zip(placements[2:end], new_addresses)
             add_launched_workers(
                 manager,
                 frompid,
                 fromconfig,
-                new_addresses,
+                [addr],
                 launched_q;
                 topology,
                 placement,
                 ppi = cnt + 1)
+        end
+        @info "launch_n_additional_processes: all $n_extra create_worker @asyncs queued"
+
+        # Pin the PRIMARY worker (placements[1]) to its planned cpu_set
+        # AFTER all additional workers have been forked. The primary is
+        # the julia process started by cloud-init at scale-set boot;
+        # unlike additional workers (launched above via
+        # `numactl --physcpubind=...` wrapper), it never went through
+        # `worker_launch_command(...; use_numactl=true)`, so without this
+        # step its kernel-level affinity remains the whole machine even
+        # though the metadata merged above claims a specific cpu_set.
+        #
+        # Order matters: pinning BEFORE the for-loop above restricts the
+        # primary's process affinity, which child forks INHERIT, and
+        # unprivileged sched_setaffinity can only set affinity to a
+        # subset of the current mask. numactl in the child trying to
+        # set a disjoint cpu_set (e.g. 60-119 when the primary is on
+        # 0-59) fails, the additional worker never starts, and the
+        # cluster sits at 1/N forever.
+        if use_numactl
+            primary_cpu_set = cpu_set_string(placements[1].cpu_set)
+            @info "self-pinning primary frompid=$frompid to cpu_set=$primary_cpu_set"
+            t0 = time()
+            try
+                remotecall_fetch(frompid, primary_cpu_set) do cpus
+                    try
+                        run(`taskset -pc $cpus $(getpid())`)
+                    catch e
+                        @warn "primary worker self-pin via taskset failed" exception=e cpus
+                    end
+                end
+                @info "primary self-pin done" elapsed_s=round(time()-t0; digits=1)
+            catch e
+                @warn "could not reach primary worker for self-pin" exception=e
+            end
         end
     end
 end
@@ -839,9 +931,13 @@ function add_launched_workers(
                     worker_placement_metadata(topology, placement, ppi))
             end
 
-            let wconfig=wconfig
+            let wconfig=wconfig, port=port, addr=bind_addr,
+                lid=wconfig.userdata["localid"]
                 @async begin
+                    @info "    create_worker: connecting" localid=lid bind_addr=addr port=port
+                    t_cw = time()
                     pid = Distributed.create_worker(manager, wconfig)
+                    @info "    create_worker: connected" localid=lid pid=pid elapsed_s=round(time()-t_cw; digits=1)
                     remote_do(Distributed.redirect_output_from_additional_worker, frompid, pid, port)
                     push!(launched_q, pid)
                 end
@@ -852,6 +948,79 @@ end
 #
 # Azure scale-set methods
 #
+
+"""
+Pull the image identity out of the scale-set template's imageReference.
+The template encodes one of two shapes:
+
+  /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/galleries/<G>/images/<I>[/versions/<V>]
+  /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/images/<I>
+
+Returns `(sigimagename, sigimageversion, imagename)`. Empties if the
+template has neither shape, in which case the caller falls through to
+`scaleset_image`'s IMDS-based resolution. When the template has a SIG
+reference without an explicit version, we resolve the latest published
+version via the Azure SIG API so the eventual `image_osdisksize` SIG
+branch has both pieces.
+"""
+function _resolve_image_from_template(manager::AzManager, template_value, subscriptionid::AbstractString, resourcegroup::AbstractString)
+    id = ""
+    try
+        if haskey(template_value["properties"], "virtualMachineProfile")
+            id = template_value["properties"]["virtualMachineProfile"]["storageProfile"]["imageReference"]["id"]
+        else
+            id = template_value["properties"]["storageProfile"]["imageReference"]["id"]
+        end
+    catch
+        return "", "", ""
+    end
+
+    parts = split(id, "/")
+    k_galleries = findfirst(==("galleries"), parts)
+    k_images    = findfirst(==("images"),    parts)
+    k_versions  = findfirst(==("versions"),  parts)
+
+    if k_galleries !== nothing && k_images !== nothing && k_images + 1 <= length(parts)
+        gallery_name = String(parts[k_galleries + 1])
+        sigimagename = String(parts[k_images + 1])
+        if k_versions !== nothing && k_versions + 1 <= length(parts)
+            return sigimagename, String(parts[k_versions + 1]), ""
+        end
+        # SIG image-def without an explicit version. Resolve latest.
+        latest = _latest_sig_version(manager, subscriptionid, resourcegroup, gallery_name, sigimagename)
+        return sigimagename, latest, ""
+    elseif k_images !== nothing && k_images + 1 <= length(parts)
+        # Managed image (no galleries segment).
+        return "", "", String(parts[k_images + 1])
+    end
+    return "", "", ""
+end
+
+"""
+Return the highest published image-version name (as a string) for the
+given SIG image-definition, or "" if no versions are published / the
+API call fails. Used by `_resolve_image_from_template` when the
+template references a SIG image-def without a specific version.
+"""
+function _latest_sig_version(manager::AzManager, subscription::AbstractString, resourcegroup::AbstractString, gallery::AbstractString, image::AbstractString)
+    try
+        url = "https://management.azure.com/subscriptions/$subscription/resourceGroups/$resourcegroup/providers/Microsoft.Compute/galleries/$gallery/images/$image/versions?api-version=2022-03-03"
+        _r = @retry manager.nretry azrequest(
+            "GET",
+            manager.verbose,
+            url,
+            ["Authorization" => "Bearer $(token(manager.session))"])
+        r = JSON.parse(String(_r.body))
+        names = String[get(v, "name", "") for v in get(r, "value", [])]
+        filter!(!isempty, names)
+        isempty(names) && return ""
+        return string(maximum(VersionNumber.(names)))
+    catch e
+        @warn "could not resolve latest SIG version" gallery image exception=e
+        return ""
+    end
+end
+
 function scaleset_image(manager::AzManager, sigimagename, sigimageversion, imagename)
     # early exit
     if imagename != "" || (sigimagename != "" && sigimageversion != "")
@@ -1303,6 +1472,21 @@ function scaleset_create_or_update(manager::AzManager, user, subscriptionid, res
     scaleset_exists = false
     for scaleset in scalesets
         if scaleset["name"] == scalesetname
+            # If the target name is already being torn down, every PUT
+            # we issue will be rejected by Azure with "OperationNotAllowed
+            # ... is marked for deletion" until the deletion completes
+            # (can be several minutes for non-empty scale sets). The
+            # default retry budget (20x exponential backoff) can burn
+            # ~50 minutes of wall-clock on this case. Fail fast with an
+            # actionable message instead - the caller should retry with
+            # a fresh group name.
+            props = get(scaleset, "properties", Dict())
+            state = get(props, "provisioningState", "")
+            if lowercase(state) == "deleting"
+                error("scale-set $resourcegroup/$scalesetname is in " *
+                      "provisioningState=Deleting; pick a different " *
+                      "`group` name (or wait for the deletion to finish).")
+            end
             n = scaleset_capacity(manager, subscriptionid, resourcegroup, scalesetname, nretry, verbose)
             scaleset_exists = true
             break

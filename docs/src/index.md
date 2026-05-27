@@ -251,12 +251,12 @@ defined by the current project.  Please note that this can add significant
 overhead to the boot-time of the VMs.
 
 # Validating your setup
-A self-contained multi-worker test is provided at `demo/multi_worker_test.jl`.
+A self-contained multi-worker test is provided at `test/multi_worker_test.jl`.
 It exercises `addprocs` end-to-end against a real Azure subscription, verifies
 that worker placement metadata matches `taskset -pc` on the workers, and
 optionally exercises the nested-MPI launch path. Configuration is driven by a
-TOML file; an annotated template is checked in at `demo/multi_worker_test.toml`.
-See the header of `demo/multi_worker_test.jl` for the full prerequisite list
+TOML file; an annotated template is checked in at `test/multi_worker_test.toml`.
+See the header of `test/multi_worker_test.jl` for the full prerequisite list
 and guidance on running it from inside an Azure VNet (the launcher must be
 routable from the worker subnet — typically a small Standard_B2s controller
 VM in the same VNet).

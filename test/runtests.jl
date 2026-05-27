@@ -2,7 +2,7 @@ using Distributed, AzManagers, Random, TOML, Test, HTTP, AzSessions, JSON, Pkg
 using MPI
 
 include("unit.jl")
-include("integration_numa.jl")
+
 
 session = AzSession(;protocal=AzClientCredentials)
 

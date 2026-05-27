@@ -151,16 +151,16 @@ jobs:
             slug:     "hb120v3"
             location: "eastus"
             spot:     "true"
-          - sku:      "Standard_HB176rs_v5"    # 176c AMD Turin-HBM
-            slug:     "hb176v5"
+          - sku:      "Standard_HB368rs_v5"    # 368c AMD Turin-HBM
+            slug:     "hb368v5"
             location: "southcentralus"
             spot:     "false"
           # ---------- larger SKUs disabled to fit a 174-vCPU spot budget ----------
           # - sku:      "Standard_HB176rs_v4"    # 176c AMD Genoa-X
           #   slug:     "hb176v4"
           #   location: "eastus"
-          # - sku:      "Standard_HB176rs_v5"    # 176c AMD Turin-HBM
-          #   slug:     "hb176v5"
+          # - sku:      "Standard_HB368rs_v5"    # 368c AMD Turin-HBM
+          #   slug:     "hb368v5"
           #   location: "southcentralus"        # also re-add to replication_regions
     env:
       TENANT_ID:       "${{ secrets.TENANT_ID }}"

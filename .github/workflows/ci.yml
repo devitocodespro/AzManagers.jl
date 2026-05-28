@@ -6,7 +6,7 @@ concurrency:
 
 on:
   push:
-    branches: [master]
+    branches: [master, release-3]
     tags: ["*"]
   pull_request:
   workflow_dispatch:

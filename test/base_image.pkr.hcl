@@ -141,7 +141,7 @@ build {
         inline = [
             "sudo apt-get -y update",
             "sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=\"--force-confdef\" -o Dpkg::Options::=\"--force-confold\" upgrade",
-            "sudo apt-get -y install git numactl util-linux openmpi-bin libopenmpi-dev"
+            "sudo apt-get -y install git gcc numactl util-linux openmpi-bin libopenmpi-dev"
         ]
         max_retries = 5
     }

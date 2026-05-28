@@ -396,6 +396,148 @@ function dump_distribution_summary(placements)
           cpu_sets       = sort(collect(cpu_sets)))
 end
 
+"""
+Parse a cpu_set range string (e.g. "0-29,60-89") into a Set{Int} of
+individual CPU IDs. Used by check_omp_pinning to compare per-OMP-thread
+affinities against the worker's planned cpu_set.
+"""
+function parse_cpu_set_string(s::AbstractString)
+    cpus = Set{Int}()
+    for part in split(s, ",")
+        part = strip(part)
+        isempty(part) && continue
+        if '-' in part
+            lo, hi = parse.(Int, split(part, "-"; limit=2))
+            union!(cpus, lo:hi)
+        else
+            push!(cpus, parse(Int, part))
+        end
+    end
+    cpus
+end
+
+const OMP_AFFINITY_SRC = """
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <sched.h>
+#include <omp.h>
+
+int main() {
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nt  = omp_get_num_threads();
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        sched_getaffinity(0, sizeof(mask), &mask);
+
+        #pragma omp critical
+        {
+            printf("thread %d/%d cpus:", tid, nt);
+            for (int i = 0; i < CPU_SETSIZE; i++) {
+                if (CPU_ISSET(i, &mask)) printf(" %d", i);
+            }
+            printf("\\n");
+        }
+    }
+    return 0;
+}
+"""
+
+"""
+Compile and run a tiny OpenMP program on each worker to verify that OMP
+threads are actually pinned to the worker's planned cpu_set. The
+placement planner sets `OMP_NUM_THREADS`, `OMP_PROC_BIND=close`, and
+`OMP_PLACES=cores` in each worker's environment; this function checks
+that those settings are effective by reading the kernel-level per-thread
+affinity mask via `sched_getaffinity`.
+
+The check runs three configurations per worker to cover both the normal
+and edge cases:
+  - default:  OMP_NUM_THREADS = omp_threads (= physical cores in cpu_set)
+  - subset:   OMP_NUM_THREADS = half the default (fewer threads than cores)
+  - oversub:  OMP_NUM_THREADS = double the default (more threads than cores)
+In ALL cases the assertion is the same: every OMP thread must run on
+CPUs within the worker's planned cpu_set. Oversubscription is valid
+(threads time-share cores) as long as affinity doesn't escape the set.
+
+Requires `gcc` on the worker (installed in the base image).
+"""
+function check_omp_pinning(placements)
+    log_section("OpenMP thread affinity check")
+    for pid in sort(collect(keys(placements)))
+        info = placements[pid]
+        expected_cpu_str = get(info, "cpu_set", "")
+        isempty(expected_cpu_str) && continue
+        expected_cpus = parse_cpu_set_string(expected_cpu_str)
+        default_omp   = get(info, "omp_threads", length(expected_cpus))
+        default_omp < 1 && (default_omp = length(expected_cpus))
+
+        # Compile once on the worker
+        try
+            remotecall_fetch(pid, OMP_AFFINITY_SRC) do src
+                write("/tmp/omp_affinity_test.c", src)
+                run(`gcc -fopenmp -o /tmp/omp_affinity_test /tmp/omp_affinity_test.c`)
+            end
+        catch e
+            @warn "pid $pid: OMP compile failed (gcc missing?)" exception=e
+            @test false
+            continue
+        end
+
+        # Run with multiple OMP_NUM_THREADS values
+        cases = [
+            ("default",        default_omp),
+            ("half (subset)",  max(1, div(default_omp, 2))),
+            ("double (oversub)", 2 * default_omp),
+        ]
+        # De-dup (e.g., default_omp=1 makes half=1, same case)
+        seen = Set{Int}()
+        unique_cases = Tuple{String,Int}[]
+        for (label, nt) in cases
+            nt in seen && continue
+            push!(seen, nt)
+            push!(unique_cases, (label, nt))
+        end
+
+        for (label, nthreads) in unique_cases
+            output = try
+                remotecall_fetch(pid, nthreads) do nt
+                    withenv("OMP_NUM_THREADS" => string(nt)) do
+                        strip(read(`/tmp/omp_affinity_test`, String))
+                    end
+                end
+            catch e
+                @warn "pid $pid OMP_NUM_THREADS=$nthreads ($label): run failed" exception=e
+                @test false
+                continue
+            end
+
+            all_inside = true
+            n_threads_seen = 0
+            for line in split(output, "\n")
+                m = match(r"thread (\d+)/(\d+) cpus:(.*)", line)
+                m === nothing && continue
+                n_threads_seen += 1
+                thread_cpus = Set(parse.(Int, split(strip(m.captures[3]))))
+                outside = setdiff(thread_cpus, expected_cpus)
+                if !isempty(outside)
+                    @warn "pid $pid thread $(m.captures[1]) ($label): CPUs $outside outside cpu_set=$expected_cpu_str"
+                    all_inside = false
+                end
+            end
+
+            if all_inside
+                @info "pid $pid OMP_NUM_THREADS=$nthreads ($label): PASS ($n_threads_seen threads, all within $expected_cpu_str)"
+            else
+                @warn "pid $pid OMP_NUM_THREADS=$nthreads ($label): FAIL"
+            end
+            @test all_inside
+            @test n_threads_seen == nthreads
+        end
+    end
+end
+
 function teardown(cfg, group, session)
     if get_bool(cfg, :scenarios, :keep)
         @warn "scenarios.keep=true; leaving workers + scale set '$group' running"
@@ -620,6 +762,13 @@ function run_pinning_case(cfg, session, topology, label, ppi)
                 # and the primary self-pin via taskset).
                 @test occursin(observed_cpu, affinity)
             end
+
+            # Property 3: OpenMP threads spawned by a C program on each
+            # worker are actually bound to CPUs within the worker's
+            # planned cpu_set (verifies OMP_NUM_THREADS / OMP_PROC_BIND
+            # / OMP_PLACES are effective, not just set in ENV).
+            observed_placements = Dict(pid => AzManagers.worker_placement(pid) for pid in workers())
+            check_omp_pinning(observed_placements)
         end
     finally
         teardown(cfg, group, session)

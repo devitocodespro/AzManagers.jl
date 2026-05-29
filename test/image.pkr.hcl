@@ -1,3 +1,11 @@
+# Per-run image template. Sources from the long-lived base image
+# (test/base_image.pkr.hcl, refreshed by refresh-base-image.yml) which
+# already has Julia + apt deps + AzManagers' Julia deps precompiled.
+# This template only needs to:
+#   - swap AzManagers to the CI run's SHA
+#   - write the per-run templates_scaleset.json (resource group / vnet /
+#     gallery / image name change every run)
+
 variable "subscription_id" {
     default = "subscriptionid"
 }
@@ -38,20 +46,39 @@ variable "virtual_subnet" {
     default = "subnet"
 }
 
-variable "julia_version_major" {
-    default = "1"
-}
-
-variable "julia_version_minor" {
-    default = "8"
-}
-
-variable "julia_version_patch" {
-    default = "0"
-}
-
 variable "azmanagers_version" {
     default = "master"
+}
+
+# Git URL the workers clone AzManagers from. Defaults to this fork; the
+# CI workflows still override it via `-var` so the URL always matches
+# `${{ github.repository }}` of the run that triggered them.
+variable "azmanagers_repo" {
+    default = "https://github.com/devitocodespro/AzManagers.jl.git"
+}
+
+# Region the baked-in test/templates.jl scale-set / VM / NIC templates
+# point at, and the VM SKU they request. ci.yml passes these via -var so
+# the same Packer file can build images for any region / SKU pair.
+variable "location" {
+    default = "eastus"
+}
+
+variable "vm_size" {
+    default = "Standard_D4s_v3"
+}
+
+# Long-lived base image to derive from. See refresh-base-image.yml.
+variable "base_resource_group" {
+    default = "azmanagers-ci-base-rg"
+}
+
+variable "base_gallery" {
+    default = "azmanagersbasegallery"
+}
+
+variable "base_image_name" {
+    default = "azmanagers-base"
 }
 
 packer {
@@ -69,16 +96,28 @@ source "azure-arm" "cofii" {
     client_id = var.client_id
     client_secret = var.client_secret
     os_type = "Linux"
-    vm_size = "Standard_D8s_v3"
-    image_publisher = "canonical"
-    image_offer = "0001-com-ubuntu-server-jammy"
-    image_sku = "22_04-lts-gen2"
+    vm_size = "Standard_D4s_v3"
+    # Boot the build VM from the precompiled base image instead of the
+    # marketplace Ubuntu image. `image_version` is omitted so Packer picks
+    # the latest version published by the refresh workflow.
+    shared_image_gallery {
+        subscription = var.subscription_id
+        resource_group = var.base_resource_group
+        gallery_name = var.base_gallery
+        image_name = var.base_image_name
+    }
     shared_image_gallery_destination {
         resource_group = var.resource_group
         gallery_name = var.gallery
         image_name = var.image_name
         image_version = var.image_version
-        replication_regions = ["South Central US"]
+        # Regions the per-run SIG image is replicated to. Keep this in
+        # sync with the matrix locations in multi-worker-test.yml and
+        # ci.yml. Each extra region adds a few minutes of replication
+        # time during packer build but lets shards in that region boot
+        # their coordinator VM from this image. South Central US is in
+        # for the HB176rs_v5 shard.
+        replication_regions = ["East US", "South Central US"]
     }
     shared_image_gallery_timeout = "120m"
     build_resource_group_name = var.resource_group
@@ -97,49 +136,14 @@ build {
         "source.azure-arm.cofii"
     ]
 
+    # AzManagers is already in the depot at whatever ref the base was built
+    # with; swap it to the test SHA. Deps stay in the depot and don't
+    # recompile because their resolved versions don't change.
     provisioner "shell" {
         inline = [
-            "echo \"Host *\" > ~/.ssh/config",
-            "echo \"    StrictHostKeyChecking    no\" >> ~/.ssh/config",
-            "echo \"    LogLevel                 ERROR\" >> ~/.ssh/config",
-            "echo \"    UserKnownHostsFile       /dev/null\" >> ~/.ssh/config"
-        ]
-    }
-
-    provisioner "shell" {
-        inline = [
-            "sudo apt-get -y update",
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=\"--force-confdef\" -o Dpkg::Options::=\"--force-confold\" upgrade",
-            "sudo apt-get -y install git"
-        ]
-        max_retries = 5
-    }
-
-    provisioner "shell" {
-        inline = [
-            "echo \"**** generating AzManagers ssh key-pair ****\"",
-            "ssh-keygen -f /home/cvx/.ssh/azmanagers_rsa -N ''"
-        ]
-    }
-
-    provisioner "shell" {
-        inline = [
-            "echo \"**** installing Julia ****\"",
-            "sudo wget https://julialang-s3.julialang.org/bin/linux/x64/${var.julia_version_major}.${var.julia_version_minor}/julia-${var.julia_version_major}.${var.julia_version_minor}.${var.julia_version_patch}-linux-x86_64.tar.gz",
-            "sudo mkdir -p /opt/julia",
-            "sudo tar --strip-components=1 -xzvf julia-${var.julia_version_major}.${var.julia_version_minor}.${var.julia_version_patch}-linux-x86_64.tar.gz -C /opt/julia",
-            "sudo rm -f julia-${var.julia_version_major}.${var.julia_version_minor}.${var.julia_version_patch}-linux-x86_64.tar.gz",
-            "sed -i '1 i export PATH=\"/opt/julia/bin:$${PATH}\"' ~/.bashrc",
-            "sed -i '1 i export JULIA_WORKER_TIMEOUT=\"720\"' ~/.bashrc"
-        ]
-    }
-
-    provisioner "shell" {
-        inline = [
-            "echo \"**** installing julia packages ****\"",
-            "julia -e 'using Pkg; Pkg.add([\"AzSessions\", \"Coverage\", \"Distributed\", \"HTTP\", \"JSON\", \"MPI\", \"MPIPreferences\", \"Random\", \"Test\"])'",
-            "julia -e 'using MPIPreferences; MPIPreferences.use_jll_binary(\"MPICH_jll\")'",
-            "julia -e 'using Pkg; Pkg.add(PackageSpec(name=\"AzManagers\", rev=\"${var.azmanagers_version}\"))'"
+            "echo \"**** swapping AzManagers to CI ref ${var.azmanagers_version} ****\"",
+            "julia -e 'using Pkg; Pkg.add(PackageSpec(url=\"${var.azmanagers_repo}\", rev=\"${var.azmanagers_version}\"))'",
+            "julia -e 'using AzManagers'"
         ]
     }
 
@@ -160,6 +164,8 @@ build {
             "export VNET_NAME=\"${var.virtual_network}\"",
             "export SUBNET_NAME=\"${var.virtual_subnet}\"",
             "export GALLERY_NAME=\"${var.gallery}\"",
+            "export LOCATION=\"${var.location}\"",
+            "export VM_SIZE=\"${var.vm_size}\"",
             "julia /tmp/templates.jl"
         ]
     }

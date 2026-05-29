@@ -1,7 +1,7 @@
 name = "AzManagers"
 uuid = "db05ebb0-6096-11e9-199b-87b703361841"
-authors = ["samtkaplan <sam.kaplan@chevron.com>"]
 version = "4.0.0"
+authors = ["samtkaplan <sam.kaplan@chevron.com>"]
 
 [deps]
 AzSessions = "f239b30d-ae6b-58be-a2d5-7e9f30e280a9"
@@ -21,8 +21,8 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
-ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [weakdeps]
@@ -34,14 +34,14 @@ MPIExt = "MPI"
 [compat]
 AzSessions = "2"
 CodecZlib = "0.7"
-HTTP = "1"
+HTTP = "1, 2"
 Hwloc = "2, 3"
 JSON = "0.21, 1"
 JWTs = "0.3"
 LibCURL = "0.6, 1"
 MPI = "0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20"
-ThreadPinning = "0.7, 1"
 TOML = "1"
+ThreadPinning = "0.7, 1"
 julia = "^1.4"
 
 [extras]

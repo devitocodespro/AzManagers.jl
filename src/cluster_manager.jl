@@ -123,6 +123,7 @@ end
 scalesets(manager::AzManager) = isdefined(manager, :scalesets) ? manager.scalesets : Dict{ScaleSet,Int}()
 scalesets() = scalesets(azmanager())
 pending_down(manager::AzManager) = isdefined(manager, :pending_down) ? manager.pending_down : Dict{ScaleSet,Set{String}}()
+pending_down(manager::AzManager, scaleset::ScaleSet) = get(pending_down(manager), scaleset, Set{String}())
 
 function delete_scaleset(manager, scaleset)
     @debug "deleting scaleset, $scaleset"
@@ -165,6 +166,7 @@ function delete_pending_down_vms()
             delete_vms(manager, scaleset.subscriptionid, scaleset.resourcegroup, scaleset.scalesetname, ids, manager.nretry, manager.verbose)
             new_capacity = max(0, scalesets(manager)[scaleset] - length(ids))
             scalesets(manager)[scaleset] = new_capacity
+            @debug "new scaleset capacity for $scaleset is $new_capacity"
             delete!(pending_down(manager), scaleset)
         catch e
             if status(e) == 404

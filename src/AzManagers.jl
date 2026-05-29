@@ -273,8 +273,6 @@ function Distributed.addprocs(::AzManager, template::AbstractDict, n::Int;
     scaleset_image!(manager, template["value"], sigimagename, sigimageversion, imagename)
     software_sanity_check(manager, imagename == "" ? sigimagename : imagename, customenv)
 
-    @async delete_pending_down_vms()
-
     _scalesets = scalesets(manager)
     scaleset = ScaleSet(subscriptionid, resourcegroup, group)
 
@@ -283,7 +281,7 @@ function Distributed.addprocs(::AzManager, template::AbstractDict, n::Int;
     julia_num_threads = nthreads_filter(julia_num_threads)
 
     @info "Provisioning $n virtual machines in scale-set $group..."
-    _scalesets[scaleset] = scaleset_create_or_update(manager, user, scaleset.subscriptionid, scaleset.resourcegroup, scaleset.scalesetname, sigimagename,
+    scaleset_create_or_update(manager, user, scaleset.subscriptionid, scaleset.resourcegroup, scaleset.scalesetname, sigimagename,
         sigimageversion, imagename, osdisksize, nretry, template, n, ppi, mpi_ranks_per_worker, mpi_flags, nvidia_enable_ecc, nvidia_enable_mig,
         hyperthreading, julia_num_threads, omp_num_threads, exename, exeflags, env, spot, maxprice, spot_base_regular_priority_count, spot_regular_percentage_above_base,
         verbose, customenv, overprovision, use_lvm)
@@ -466,8 +464,15 @@ function Distributed.kill(manager::AzManager, id::Int, config::WorkerConfig)
 
     scaleset = ScaleSet(u["subscriptionid"], u["resourcegroup"], u["scalesetname"])
 
-    add_instance_to_pending_down_list(manager, scaleset, u["instanceid"])
-    add_instance_to_deleted_list(manager, scaleset, u["instanceid"])
+    lock(manager.lock)
+    try
+        add_instance_to_pending_down_list(manager, scaleset, u["instanceid"])
+        add_instance_to_deleted_list(manager, scaleset, u["instanceid"])
+    catch e
+        throw(e)
+    finally
+        unlock(manager.lock)
+    end
 
     @debug "...kill, pushed."
     nothing
@@ -1475,32 +1480,21 @@ function scaleset_create_or_update(manager::AzManager, user, subscriptionid, res
         _template["tags"]["platformsettings.host_environment.disablehyperthreading"] = hyperthreading ? "False" : "True"
     end
 
-    n = 0
-    scalesets = get(r, "value", [])
-    scaleset_exists = false
-    for scaleset in scalesets
-        if scaleset["name"] == scalesetname
-            # If the target name is already being torn down, every PUT
-            # we issue will be rejected by Azure with "OperationNotAllowed
-            # ... is marked for deletion" until the deletion completes
-            # (can be several minutes for non-empty scale sets). The
-            # default retry budget (20x exponential backoff) can burn
-            # ~50 minutes of wall-clock on this case. Fail fast with an
-            # actionable message instead - the caller should retry with
-            # a fresh group name.
-            props = get(scaleset, "properties", Dict())
-            state = get(props, "provisioningState", "")
+    # If the target scale-set is mid-deletion, every PUT we issue is rejected
+    # by Azure with "OperationNotAllowed ... is marked for deletion" until the
+    # deletion completes (minutes for non-empty sets), burning the full retry
+    # budget. Fail fast - the caller should retry with a fresh `group` name.
+    for _existing in get(r, "value", [])
+        if _existing["name"] == scalesetname
+            state = get(get(_existing, "properties", Dict()), "provisioningState", "")
             if lowercase(state) == "deleting"
                 error("scale-set $resourcegroup/$scalesetname is in " *
                       "provisioningState=Deleting; pick a different " *
                       "`group` name (or wait for the deletion to finish).")
             end
-            n = scaleset_capacity(manager, subscriptionid, resourcegroup, scalesetname, nretry, verbose)
-            scaleset_exists = true
             break
         end
     end
-    n += δn
 
     @debug "about to check quota"
 
@@ -1523,21 +1517,36 @@ function scaleset_create_or_update(manager::AzManager, user, subscriptionid, res
         end
     end
 
-    @debug "done checking quota, δn=$(δn), n=$n"
+    @debug "done checking quota, δn=$(δn)"
 
-    _template["sku"]["capacity"] = n
-    _r = @retry nretry azrequest(
-        "PUT",
-        verbose,
-        "https://management.azure.com/subscriptions/$subscriptionid/resourceGroups/$resourcegroup/providers/Microsoft.Compute/virtualMachineScaleSets/$scalesetname?api-version=2023-03-01",
-        ["Content-type"=>"application/json", "Authorization"=>"Bearer $(token(manager.session))"],
-        String(JSON.json(_template)))
+    # Track the authoritative capacity in `manager.scalesets` under the manager
+    # lock so a concurrent `delete_pending_down_vms` can't clobber the size we
+    # PUT (the scaleset create/delete race fixed upstream in #222).
+    lock(manager.lock)
+    try
+        _scaleset = ScaleSet(subscriptionid, resourcegroup, scalesetname)
+        _template["sku"]["capacity"] = manager.scalesets[_scaleset] =
+            _scaleset ∈ keys(scalesets(manager)) ? manager.scalesets[_scaleset] + δn : δn
 
-    if manager.show_quota
-        @info "Quota after requesting that the scale-set is created or grows" remaining_resource(_r)
+        @debug "setting capacity of scale-set $scalesetname to $(_template["sku"]["capacity"]), scaleset=$(manager.scalesets[_scaleset])"
+
+        _r = @retry nretry azrequest(
+            "PUT",
+            verbose,
+            "https://management.azure.com/subscriptions/$subscriptionid/resourceGroups/$resourcegroup/providers/Microsoft.Compute/virtualMachineScaleSets/$scalesetname?api-version=2023-03-01",
+            ["Content-type"=>"application/json", "Authorization"=>"Bearer $(token(manager.session))"],
+            String(JSON.json(_template)))
+
+        if manager.show_quota
+            @info "Quota after requesting that the scale-set is created or grows" remaining_resource(_r)
+        end
+    catch e
+        throw(e)
+    finally
+        unlock(manager.lock)
     end
 
-    n
+    nothing
 end
 
 function delete_vms(manager::AzManager, subscriptionid, resourcegroup, scalesetname, ids, nretry, verbose)

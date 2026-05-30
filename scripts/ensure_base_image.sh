@@ -27,7 +27,7 @@ set -euo pipefail
 : "${BASE_VNET:=azmanagers-base-vnet}"
 : "${BASE_SUBNET:=default}"
 : "${BASE_NSG:=azmanagers-base-nsg}"
-: "${LOCATION:=eastus}"
+: "${LOCATION:=southcentralus}"
 : "${JULIA_VERSION:=1.12.0}"
 : "${AZMANAGERS_REF:=master}"
 : "${AZMANAGERS_REPO:=https://github.com/devitocodespro/AzManagers.jl.git}"

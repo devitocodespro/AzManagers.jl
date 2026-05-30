@@ -11,7 +11,7 @@ imagename = ENV["IMAGE_NAME"]
 # they request. Defaulted here so a local `julia /tmp/templates.jl` works
 # stand-alone, but ci.yml overrides both via Packer vars -> env so changing
 # region or SKU only requires editing the workflow.
-location = get(ENV, "LOCATION", "eastus")
+location = get(ENV, "LOCATION", "southcentralus")
 # Standard_D4s_v3: 4 vCPU, HT enabled -> 2 physical cores. The test
 # `nphysical_cores` testset in runtests.jl asserts ncores == 2 for cbox02,
 # so the SKU must report two physical cores. D2s_v3 reports only one

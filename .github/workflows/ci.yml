@@ -38,6 +38,9 @@ jobs:
       NSG_NAME: "${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-nsg"
       SUBNET_NAME: "default"
       COMMIT_SHA: "${{ github.sha }}"
+      # Region defaults to southcentralus (the upstream account's quota lives
+      # there). Override per-repo by setting `vars.LOCATION` (Settings -> Vars).
+      LOCATION: "${{ vars.LOCATION || 'southcentralus' }}"
     steps:
       - uses: actions/checkout@v3
       - uses: julia-actions/setup-julia@v1
@@ -60,7 +63,7 @@ jobs:
       - name: Create Prereq. Azure Resources
         run: |
           az login --service-principal   -u "$CLIENT_ID" -p "$CLIENT_SECRET" -t "$TENANT_ID"
-          az group create                -g "$RESOURCE_GROUP" -l eastus --tags "environment=dev"
+          az group create                -g "$RESOURCE_GROUP" -l "$LOCATION" --tags "environment=dev"
           az group wait                  -g "$RESOURCE_GROUP" --created 
           az sig create                  -g "$RESOURCE_GROUP" -r "$GALLERY_NAME"
           az sig image-definition create -g "$RESOURCE_GROUP" -r "$GALLERY_NAME" -i "$IMAGE_NAME" -p "canonical" -f "0001-com-ubuntu-server-jammy" -s "22_04-lts-gen2" --os-type linux --hyper-v-generation V2
@@ -95,7 +98,7 @@ jobs:
             -var "gallery=${GALLERY_NAME}" \
             -var "azmanagers_version=${{ github.event.pull_request.head.sha || github.sha }}" \
             -var "azmanagers_repo=https://github.com/${{ github.repository }}.git" \
-            -var "location=eastus" \
+            -var "location=${LOCATION}" \
             -var "vm_size=Standard_D4s_v3" \
             ${GITHUB_WORKSPACE}/test/image.pkr.hcl
 
@@ -120,7 +123,7 @@ jobs:
           echo ""
 
           echo "Running the Unit Tests and Code Coverage..."
-          ssh -o StrictHostKeyChecking=no -i /home/runner/.ssh/azmanagers_rsa cvx@$ipaddress "julia -e 'using Pkg; Pkg.test(\"AzManagers\"; coverage=true); using AzManagers; include(joinpath(pkgdir(AzManagers), \"test\", \"julia-codecov.jl\"))'"
+          ssh -o StrictHostKeyChecking=no -i /home/runner/.ssh/azmanagers_rsa cvx@$ipaddress "LOCATION='$LOCATION' julia -e 'using Pkg; Pkg.test(\"AzManagers\"; coverage=true); using AzManagers; include(joinpath(pkgdir(AzManagers), \"test\", \"julia-codecov.jl\"))'"
           echo ""
 
           echo "scp-ing the Coverage Report..."
